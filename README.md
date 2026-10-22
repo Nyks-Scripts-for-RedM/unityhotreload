@@ -65,6 +65,7 @@ For a local clone on disk:
    - **Instant on Save (`Ctrl + S`):** Compiles and patches modified `.cs` files immediately when saved in your IDE.
    - **On Unity Focus (When Clicked):** Queues modified `.cs` files while you work in your IDE and patches them the instant you click back into the Unity Editor window.
 3. Edit any C# method body or add new methods/fields in **Edit Mode** or **Play Mode**. Changes are compiled and detoured in memory without triggering a Unity Domain Reload.
+4. When a structural change requires a full Unity compilation pass, press **`Ctrl + Shift + R`** (or click **Tools > Hot Reload Pro — Full Domain Reload**).
 
 ---
 
