@@ -1,6 +1,7 @@
 // Copyright 2026 Togan (nyks000)
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System;
 using System.Collections.Generic;
 using Nyks.HotReload.Editor.Core;
 using Nyks.HotReload.Editor.Detour;
@@ -334,7 +335,7 @@ namespace Nyks.HotReload.Editor.UI
                 EditorGUILayout.LabelField($"🧬 {comp.GetType().Name} ({selectedGo.name})", EditorStyles.boldLabel);
                 foreach (DynamicFieldDescriptor desc in fields)
                 {
-                    HotReloadSceneOverlay.DrawDynamicFieldControl(comp, desc);
+                    DrawDynamicFieldControl(comp, desc);
                 }
                 EditorGUILayout.EndVertical();
             }
@@ -345,6 +346,66 @@ namespace Nyks.HotReload.Editor.UI
                     $"Selected GameObject '{selectedGo.name}' has no dynamically added fields yet.\n" +
                     "Try adding a new field (e.g., '[SerializeField] private float _boostBonus = 25f;') to one of its scripts during Play Mode and press Ctrl+S!",
                     MessageType.Info);
+            }
+        }
+
+        private static void DrawDynamicFieldControl(object instance, DynamicFieldDescriptor desc)
+        {
+            if (desc == null) return;
+            object currentVal = HotReloadStateStore.GetBoxed(instance, desc);
+            string label = ObjectNames.NicifyVariableName(desc.FieldName);
+
+            EditorGUI.BeginChangeCheck();
+            object newVal = currentVal;
+
+            if (desc.FieldType == typeof(float))
+            {
+                float v = currentVal is float fv ? fv : 0f;
+                newVal = EditorGUILayout.FloatField(label, v);
+            }
+            else if (desc.FieldType == typeof(int))
+            {
+                int v = currentVal is int iv ? iv : 0;
+                newVal = EditorGUILayout.IntField(label, v);
+            }
+            else if (desc.FieldType == typeof(bool))
+            {
+                bool v = currentVal is bool bv && bv;
+                newVal = EditorGUILayout.Toggle(label, v);
+            }
+            else if (desc.FieldType == typeof(string))
+            {
+                string v = currentVal as string ?? string.Empty;
+                newVal = EditorGUILayout.TextField(label, v);
+            }
+            else if (desc.FieldType == typeof(Vector2))
+            {
+                Vector2 v = currentVal is Vector2 v2 ? v2 : Vector2.zero;
+                newVal = EditorGUILayout.Vector2Field(label, v);
+            }
+            else if (desc.FieldType == typeof(Vector3))
+            {
+                Vector3 v = currentVal is Vector3 v3 ? v3 : Vector3.zero;
+                newVal = EditorGUILayout.Vector3Field(label, v);
+            }
+            else if (desc.FieldType == typeof(Color))
+            {
+                Color v = currentVal is Color c ? c : Color.white;
+                newVal = EditorGUILayout.ColorField(label, v);
+            }
+            else if (desc.FieldType != null && desc.FieldType.IsEnum)
+            {
+                Enum v = currentVal is Enum ev ? ev : (Enum)Activator.CreateInstance(desc.FieldType);
+                newVal = EditorGUILayout.EnumPopup(label, v);
+            }
+            else
+            {
+                EditorGUILayout.LabelField(label, currentVal != null ? currentVal.ToString() : "null");
+            }
+
+            if (EditorGUI.EndChangeCheck())
+            {
+                HotReloadStateStore.SetBoxed(instance, desc, newVal);
             }
         }
 
