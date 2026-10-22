@@ -278,15 +278,20 @@ namespace Nyks.HotReload.Editor.Core
                             $"set => global::Nyks.HotReload.Editor.State.HotReloadStateStore.Set<{typeName}>(this, \"{fieldKey}\", value); }}");
                     }
 
+                    Type resolvedFieldType = ResolvePrimitiveOrUnityType(typeName);
+                    bool requiresUnitySerialization = isPublicOrSerialized && resolvedFieldType == typeof(object);
+
                     var descriptor = new DynamicFieldDescriptor
                     {
                         OwnerTypeFullName = ownerTypeFullName,
                         FieldName = varName,
+                        DeclaredTypeName = typeName,
                         FieldKey = fieldKey,
-                        FieldType = ResolvePrimitiveOrUnityType(typeName),
+                        FieldType = resolvedFieldType,
                         DefaultValue = EvaluateSimpleLiteral(defaultExpr, typeName),
                         IsStatic = isStatic,
-                        IsPublicOrSerialized = isPublicOrSerialized
+                        IsPublicOrSerialized = isPublicOrSerialized,
+                        RequiresUnityObjectSerialization = requiresUnitySerialization
                     };
                     addedFieldsOut.Add(descriptor);
                     HotReloadStateStore.RegisterDynamicField(descriptor);

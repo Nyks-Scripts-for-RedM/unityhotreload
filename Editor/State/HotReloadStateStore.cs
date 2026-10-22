@@ -15,11 +15,13 @@ namespace Nyks.HotReload.Editor.State
     {
         public string OwnerTypeFullName { get; set; }
         public string FieldName { get; set; }
+        public string DeclaredTypeName { get; set; }
         public string FieldKey { get; set; }
         public Type FieldType { get; set; }
         public object DefaultValue { get; set; }
         public bool IsStatic { get; set; }
         public bool IsPublicOrSerialized { get; set; }
+        public bool RequiresUnityObjectSerialization { get; set; }
     }
 
     /// <summary>

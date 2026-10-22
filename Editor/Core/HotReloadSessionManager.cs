@@ -67,6 +67,7 @@ namespace Nyks.HotReload.Editor.Core
 
         private static readonly List<HotReloadPatchEvent> _history = new List<HotReloadPatchEvent>(64);
         private static readonly HashSet<string> _dirtyScriptsSinceDomainReload = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> _loggedReloadAdvisories = new HashSet<string>(StringComparer.Ordinal);
 
         private static bool _autoRefreshLockedByUs;
         private static string _lastModifiedScriptPath;
@@ -216,10 +217,18 @@ namespace Nyks.HotReload.Editor.Core
                 foreach (DynamicFieldDescriptor addedField in compileResult.RewriteInfo.AddedFields)
                 {
                     evt.AddedFields.Add($"{addedField.OwnerTypeFullName}.{addedField.FieldName}");
+
+                    if (addedField.RequiresUnityObjectSerialization)
+                    {
+                        LogDomainReloadAdvisoryOnce(
+                            $"SerializedRef:{addedField.FieldKey}",
+                            $"New serialized reference field (<b>{addedField.DeclaredTypeName} {addedField.FieldName}</b>) detected in <b>{evt.ScriptName}</b>. " +
+                            "To assign object references via Drag & Drop in the Unity Inspector, click <b>Tools > Hot Reload Pro > Full Domain Reload</b> once.");
+                    }
                 }
             }
 
-            int patchedCount = ApplyAssemblyDetours(compileResult.CompiledAssembly, evt.PatchedMethods, evt.Diagnostics);
+            int patchedCount = ApplyAssemblyDetours(compileResult.CompiledAssembly, evt.ScriptName, evt.PatchedMethods, evt.Diagnostics);
 
             totalSw.Stop();
             evt.Success = patchedCount > 0 || evt.AddedFields.Count > 0;
@@ -253,6 +262,7 @@ namespace Nyks.HotReload.Editor.Core
         public static void ForceFullUnityReload()
         {
             _dirtyScriptsSinceDomainReload.Clear();
+            _loggedReloadAdvisories.Clear();
             ReleaseAutoRefreshLock();
             RevertAllPatches();
 
@@ -281,6 +291,7 @@ namespace Nyks.HotReload.Editor.Core
                     NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size
                 };
 
+                _watcher.Created += OnFileChanged;
                 _watcher.Changed += OnFileChanged;
                 _watcher.Renamed += OnFileRenamed;
                 _watcher.EnableRaisingEvents = true;
@@ -298,6 +309,7 @@ namespace Nyks.HotReload.Editor.Core
                 try
                 {
                     _watcher.EnableRaisingEvents = false;
+                    _watcher.Created -= OnFileChanged;
                     _watcher.Changed -= OnFileChanged;
                     _watcher.Renamed -= OnFileRenamed;
                     _watcher.Dispose();
@@ -481,6 +493,7 @@ namespace Nyks.HotReload.Editor.Core
 
         private static int ApplyAssemblyDetours(
             Assembly patchAssembly,
+            string scriptName,
             List<string> patchedMethodNamesOut,
             List<CompilerDiagnosticEntry> diagnosticsOut)
         {
@@ -517,7 +530,54 @@ namespace Nyks.HotReload.Editor.Core
                 Type originalType = FindOriginalRuntimeType(patchType);
                 if (originalType == null)
                 {
+                    LogDomainReloadAdvisoryOnce(
+                        $"NewType:{patchType.FullName}",
+                        $"New class/type (<b>{patchType.Name}</b>) detected in <b>{scriptName}</b>. " +
+                        "For Unity's native engine and 'Add Component' menu to register this new type, click <b>Tools > Hot Reload Pro > Full Domain Reload</b> once.");
                     continue;
+                }
+
+                if (patchType.IsEnum)
+                {
+                    if (HasEnumChanges(originalType, patchType))
+                    {
+                        LogDomainReloadAdvisoryOnce(
+                            $"EnumChange:{patchType.FullName}",
+                            $"Enum definition (<b>{patchType.Name}</b>) was modified in <b>{scriptName}</b>. " +
+                            "To update enum values across the Inspector and project, click <b>Tools > Hot Reload Pro > Full Domain Reload</b> once.");
+                    }
+                    continue;
+                }
+
+                if (patchType.IsInterface)
+                {
+                    LogDomainReloadAdvisoryOnce(
+                        $"InterfaceChange:{patchType.FullName}",
+                        $"Interface (<b>{patchType.Name}</b>) was modified in <b>{scriptName}</b>. " +
+                        "To apply structural interface changes across the project, click <b>Tools > Hot Reload Pro > Full Domain Reload</b> once.");
+                    continue;
+                }
+
+                if (patchType.IsGenericTypeDefinition)
+                {
+                    LogDomainReloadAdvisoryOnce(
+                        $"GenericType:{patchType.FullName}",
+                        $"Generic type (<b>{patchType.Name}</b>) was modified in <b>{scriptName}</b>. " +
+                        "To apply generic type signature changes, click <b>Tools > Hot Reload Pro > Full Domain Reload</b> once.");
+                }
+                else if (patchType.IsValueType && !patchType.IsEnum)
+                {
+                    LogDomainReloadAdvisoryOnce(
+                        $"StructType:{patchType.FullName}",
+                        $"Struct (<b>{patchType.Name}</b>) was modified in <b>{scriptName}</b>. " +
+                        "To realign value-type memory layouts, click <b>Tools > Hot Reload Pro > Full Domain Reload</b> once.");
+                }
+                else if (HasInheritanceOrInterfaceChanges(originalType, patchType))
+                {
+                    LogDomainReloadAdvisoryOnce(
+                        $"InheritanceChange:{patchType.FullName}",
+                        $"Inheritance hierarchy or implemented interfaces of <b>{patchType.Name}</b> changed in <b>{scriptName}</b>. " +
+                        "To apply structural inheritance changes, click <b>Tools > Hot Reload Pro > Full Domain Reload</b> once.");
                 }
 
                 SynchronizeStaticFields(originalType, patchType);
@@ -665,6 +725,80 @@ namespace Nyks.HotReload.Editor.Core
                         // Ignore non-copyable static fields
                     }
                 }
+            }
+        }
+
+        private static bool HasEnumChanges(Type originalEnum, Type patchEnum)
+        {
+            if (!originalEnum.IsEnum || !patchEnum.IsEnum)
+            {
+                return false;
+            }
+
+            string[] origNames = Enum.GetNames(originalEnum);
+            string[] patchNames = Enum.GetNames(patchEnum);
+            if (origNames.Length != patchNames.Length)
+            {
+                return true;
+            }
+
+            for (int i = 0; i < origNames.Length; i++)
+            {
+                if (!string.Equals(origNames[i], patchNames[i], StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static bool HasInheritanceOrInterfaceChanges(Type originalType, Type patchType)
+        {
+            string origBase = originalType.BaseType != null ? originalType.BaseType.FullName : string.Empty;
+            string patchBase = patchType.BaseType != null ? patchType.BaseType.FullName : string.Empty;
+
+            if (!string.Equals(origBase, patchBase, StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            Type[] origIfaces = originalType.GetInterfaces();
+            Type[] patchIfaces = patchType.GetInterfaces();
+            if (origIfaces.Length != patchIfaces.Length)
+            {
+                return true;
+            }
+
+            var origSet = new HashSet<string>(StringComparer.Ordinal);
+            for (int i = 0; i < origIfaces.Length; i++)
+            {
+                if (origIfaces[i].FullName != null)
+                {
+                    origSet.Add(origIfaces[i].FullName);
+                }
+            }
+
+            for (int i = 0; i < patchIfaces.Length; i++)
+            {
+                if (patchIfaces[i].FullName != null && !origSet.Contains(patchIfaces[i].FullName))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static void LogDomainReloadAdvisoryOnce(string advisoryKey, string message)
+        {
+            if (string.IsNullOrEmpty(advisoryKey))
+            {
+                return;
+            }
+
+            if (_loggedReloadAdvisories.Add(advisoryKey))
+            {
+                Debug.LogWarning($"<color=#FBBF24><b>[⚠️ Hot Reload Pro — Domain Reload Required]</b></color> {message}");
             }
         }
 
