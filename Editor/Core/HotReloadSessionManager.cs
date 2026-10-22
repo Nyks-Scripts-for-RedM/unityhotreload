@@ -820,7 +820,7 @@ namespace Nyks.HotReload.Editor.Core
                                 LogDomainReloadAdvisoryOnce(
                                     $"NewUnityMsg:{originalType.FullName}.{patchMethod.Name}",
                                     $"New Unity lifecycle/physics callback '<b>{originalType.Name}.{patchMethod.Name}()</b>' was added to <b>{scriptName}</b>. " +
-                                    "Because this method did not exist when Unity last built its native C++ callback table, click <b>Tools > Hot Reload Pro > Full Domain Reload</b> (or press <b>Ctrl+Shift+R</b>) once.");
+                                    "Because this method did not exist when Unity last built its native C++ callback table, click <b>Tools > Hot Reload Pro > Full Domain Reload</b> (or press <b>Ctrl+Alt+R</b>) once.");
                                 continue;
                             }
 

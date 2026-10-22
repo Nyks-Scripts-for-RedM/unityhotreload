@@ -34,10 +34,10 @@ namespace Nyks.HotReload.Editor.UI
             window.Show();
         }
 
-        [MenuItem("Tools/🔄 Hot Reload Pro — Full Domain Reload %#r", false, 101)]
+        [MenuItem("Tools/🔄 Hot Reload Pro — Full Domain Reload %&r", false, 101)]
         public static void ShortcutFullDomainReload()
         {
-            Debug.Log("<color=#38BDF8><b>[⚡ Hot Reload Pro]</b></color> Triggering Full Domain Reload (<b>Ctrl+Shift+R</b>)...");
+            Debug.Log("<color=#38BDF8><b>[⚡ Hot Reload Pro]</b></color> Triggering Full Domain Reload (<b>Ctrl+Alt+R</b>)...");
             HotReloadSessionManager.ForceFullUnityReload();
         }
 
@@ -210,7 +210,7 @@ namespace Nyks.HotReload.Editor.UI
             }
             GUI.enabled = true;
 
-            if (GUILayout.Button(new GUIContent("🔄 Full Domain Reload (Ctrl+Shift+R)", "Triggers a full Unity script compilation and Domain Reload (Shortcut: Ctrl+Shift+R)."), GUILayout.Height(24f)))
+            if (GUILayout.Button(new GUIContent("🔄 Full Domain Reload (Ctrl+Alt+R)", "Triggers a full Unity script compilation and Domain Reload (Shortcut: Ctrl+Alt+R)."), GUILayout.Height(24f)))
             {
                 HotReloadSessionManager.ForceFullUnityReload();
             }
