@@ -171,11 +171,75 @@ namespace Nyks.HotReload.Editor.Core
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
 
+            PurgeOrphanScriptableSingletons();
+
             EditorApplication.delayCall += () =>
             {
+                PurgeOrphanScriptableSingletons();
                 StartFileWatcher();
                 UpdateAutoRefreshLockState();
             };
+        }
+
+        private static void PurgeOrphanScriptableSingletons()
+        {
+            try
+            {
+                string[] targetTypeNames =
+                {
+                    "UnityEditor.PackageManager.UI.Internal.ServicesContainer",
+                    "UnityEditor.PackageManager.UI.Internal.PackageManagerProjectSettings"
+                };
+
+                bool destroyedAny = false;
+
+                foreach (Assembly asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    if (asm == null || asm.IsDynamic) continue;
+
+                    foreach (string typeName in targetTypeNames)
+                    {
+                        Type t = asm.GetType(typeName, false);
+                        if (t == null || t.BaseType == null) continue;
+
+                        FieldInfo instanceField = t.BaseType.GetField("s_Instance", BindingFlags.Static | BindingFlags.NonPublic);
+                        if (instanceField == null) continue;
+
+                        UnityEngine.Object activeInstance = instanceField.GetValue(null) as UnityEngine.Object;
+                        UnityEngine.Object[] allInstances = Resources.FindObjectsOfTypeAll(t);
+
+                        if (allInstances != null && allInstances.Length > 1)
+                        {
+                            if (activeInstance == null)
+                            {
+                                activeInstance = allInstances[0];
+                                instanceField.SetValue(null, activeInstance);
+                            }
+
+                            for (int i = 0; i < allInstances.Length; i++)
+                            {
+                                UnityEngine.Object candidate = allInstances[i];
+                                if (candidate != null && !ReferenceEquals(candidate, activeInstance))
+                                {
+                                    UnityEngine.Object.DestroyImmediate(candidate, true);
+                                    destroyedAny = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (destroyedAny)
+                {
+                    Type logEntriesType = typeof(EditorApplication).Assembly.GetType("UnityEditor.LogEntries");
+                    MethodInfo clearMethod = logEntriesType?.GetMethod("Clear", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                    clearMethod?.Invoke(null, null);
+                }
+            }
+            catch
+            {
+                // Ignore reflection errors across Unity versions
+            }
         }
 
         /// <summary>
@@ -446,6 +510,7 @@ namespace Nyks.HotReload.Editor.Core
 
         private static void OnBeforeAssemblyReload()
         {
+            PurgeOrphanScriptableSingletons();
             DisposeFileWatcher();
             RevertAllPatches();
             ReleaseAutoRefreshLock();
