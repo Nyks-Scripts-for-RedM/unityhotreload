@@ -69,6 +69,27 @@ namespace Nyks.HotReload.Editor.Core
         private static readonly HashSet<string> _dirtyScriptsSinceDomainReload = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static readonly HashSet<string> _loggedReloadAdvisories = new HashSet<string>(StringComparer.Ordinal);
 
+        private sealed class DynamicLifecycleHook
+        {
+            public Type OriginalComponentType;
+            public string MethodName;
+            public IntPtr FunctionPointer;
+        }
+
+        private static readonly Dictionary<string, DynamicLifecycleHook> _dynamicLifecycleHooks =
+            new Dictionary<string, DynamicLifecycleHook>(StringComparer.Ordinal);
+
+        private static readonly HashSet<string> _unityNativeMessagesRequiringReload = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "Awake", "OnEnable", "OnDisable", "OnDestroy",
+            "OnTriggerEnter", "OnTriggerStay", "OnTriggerExit",
+            "OnTriggerEnter2D", "OnTriggerStay2D", "OnTriggerExit2D",
+            "OnCollisionEnter", "OnCollisionStay", "OnCollisionExit",
+            "OnCollisionEnter2D", "OnCollisionStay2D", "OnCollisionExit2D",
+            "OnMouseDown", "OnMouseUp", "OnMouseEnter", "OnMouseExit", "OnMouseOver", "OnMouseDrag",
+            "OnBecameVisible", "OnBecameInvisible", "OnControllerColliderHit", "OnAnimatorMove", "OnAnimatorIK"
+        };
+
         private static bool _autoRefreshLockedByUs;
         private static string _lastModifiedScriptPath;
         private static bool _warmedUp;
@@ -168,6 +189,7 @@ namespace Nyks.HotReload.Editor.Core
         {
             _startupTime = EditorApplication.timeSinceStartup;
             EditorApplication.update += OnEditorUpdate;
+            Application.onBeforeRender += OnBeforeRenderDynamicUpdates;
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
 
@@ -282,6 +304,7 @@ namespace Nyks.HotReload.Editor.Core
         /// </summary>
         public static int RevertAllPatches()
         {
+            _dynamicLifecycleHooks.Clear();
             int count = NativeMethodDetour.RevertAll();
             HotReloadStateStore.ClearAll();
             OnStatusChanged?.Invoke();
@@ -646,6 +669,27 @@ namespace Nyks.HotReload.Editor.Core
                     MethodInfo originalMethod = FindMatchingOriginalMethod(originalType, patchMethod, flags);
                     if (originalMethod == null)
                     {
+                        if (!patchMethod.IsStatic && patchMethod.GetParameters().Length == 0 &&
+                            typeof(MonoBehaviour).IsAssignableFrom(originalType))
+                        {
+                            if (patchMethod.Name == "Update" || patchMethod.Name == "LateUpdate" || patchMethod.Name == "FixedUpdate")
+                            {
+                                if (TryRegisterDynamicLifecycleHook(originalType, patchMethod))
+                                {
+                                    patchedCount++;
+                                    patchedMethodNamesOut.Add($"{originalType.Name}.{patchMethod.Name} (Dynamic Bridge)");
+                                }
+                                continue;
+                            }
+
+                            if (_unityNativeMessagesRequiringReload.Contains(patchMethod.Name))
+                            {
+                                LogDomainReloadAdvisoryOnce(
+                                    $"NewUnityMsg:{originalType.FullName}.{patchMethod.Name}",
+                                    $"New Unity lifecycle/physics callback '<b>{originalType.Name}.{patchMethod.Name}()</b>' was added to <b>{scriptName}</b>. " +
+                                    "Because this method did not exist when Unity last built its native C++ callback table, click <b>Tools > Hot Reload Pro > Full Domain Reload</b> once.");
+                            }
+                        }
                         continue;
                     }
 
@@ -744,6 +788,73 @@ namespace Nyks.HotReload.Editor.Core
             }
 
             return null;
+        }
+
+        private static unsafe bool TryRegisterDynamicLifecycleHook(Type originalType, MethodInfo patchMethod)
+        {
+            try
+            {
+                System.Runtime.CompilerServices.RuntimeHelpers.PrepareMethod(patchMethod.MethodHandle);
+                IntPtr fnPtr = patchMethod.MethodHandle.GetFunctionPointer();
+                if (fnPtr == IntPtr.Zero)
+                {
+                    return false;
+                }
+
+                string key = $"{originalType.FullName}.{patchMethod.Name}";
+                _dynamicLifecycleHooks[key] = new DynamicLifecycleHook
+                {
+                    OriginalComponentType = originalType,
+                    MethodName = patchMethod.Name,
+                    FunctionPointer = fnPtr
+                };
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static unsafe void OnBeforeRenderDynamicUpdates()
+        {
+            if (!EditorApplication.isPlaying || _dynamicLifecycleHooks.Count == 0)
+            {
+                return;
+            }
+
+            foreach (var kvp in _dynamicLifecycleHooks)
+            {
+                DynamicLifecycleHook hook = kvp.Value;
+                if (hook == null || hook.OriginalComponentType == null || hook.FunctionPointer == IntPtr.Zero)
+                {
+                    continue;
+                }
+
+#pragma warning disable CS0618
+                UnityEngine.Object[] instances = UnityEngine.Object.FindObjectsOfType(hook.OriginalComponentType);
+#pragma warning restore CS0618
+                if (instances == null || instances.Length == 0)
+                {
+                    continue;
+                }
+
+                var fn = (delegate*<object, void>)hook.FunctionPointer;
+                for (int i = 0; i < instances.Length; i++)
+                {
+                    if (instances[i] is MonoBehaviour mb && mb != null && mb.isActiveAndEnabled)
+                    {
+                        try
+                        {
+                            fn(mb);
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.LogException(ex, mb);
+                        }
+                    }
+                }
+            }
         }
 
         private static void SynchronizeStaticFields(Type originalType, Type patchType)
