@@ -31,7 +31,6 @@ namespace Nyks.HotReload.Editor.UI
 
             HotReloadSessionManager.OnPatchApplied += OnPatchApplied;
             SceneView.duringSceneGui += OnDuringSceneGui;
-            UnityEditor.Editor.finishedDefaultHeaderGUI += OnInspectorHeaderGui;
         }
 
         private static void OnPatchApplied(HotReloadPatchEvent evt)
@@ -162,123 +161,6 @@ namespace Nyks.HotReload.Editor.UI
 
             GUI.color = prevColor;
             Handles.EndGUI();
-        }
-
-        private static void OnInspectorHeaderGui(UnityEditor.Editor editor)
-        {
-            if (editor == null || !(editor.target is GameObject go))
-            {
-                return;
-            }
-
-            MonoBehaviour[] components = go.GetComponents<MonoBehaviour>();
-            if (components == null || components.Length == 0)
-            {
-                return;
-            }
-
-            bool headerDrawn = false;
-
-            for (int i = 0; i < components.Length; i++)
-            {
-                MonoBehaviour comp = components[i];
-                if (comp == null)
-                {
-                    continue;
-                }
-
-                string typeFullName = comp.GetType().FullName;
-                IReadOnlyList<DynamicFieldDescriptor> dynFields = HotReloadStateStore.GetDynamicFieldsForType(typeFullName);
-                if (dynFields == null || dynFields.Count == 0)
-                {
-                    continue;
-                }
-
-                if (!headerDrawn)
-                {
-                    headerDrawn = true;
-                    EditorGUILayout.Space(4f);
-                    EditorGUILayout.BeginVertical(EditorStyles.helpBox);
-                    EditorGUILayout.LabelField("⚡ Hot Reload — Live Dynamic Fields", EditorStyles.boldLabel);
-                }
-
-                EditorGUILayout.LabelField($"Component: {comp.GetType().Name}", EditorStyles.miniBoldLabel);
-
-                for (int f = 0; f < dynFields.Count; f++)
-                {
-                    DrawDynamicFieldControl(comp, dynFields[f]);
-                }
-            }
-
-            if (headerDrawn)
-            {
-                EditorGUILayout.EndVertical();
-                EditorGUILayout.Space(4f);
-            }
-        }
-
-        internal static void DrawDynamicFieldControl(object instance, DynamicFieldDescriptor desc)
-        {
-            if (desc == null)
-            {
-                return;
-            }
-
-            object currentVal = HotReloadStateStore.GetBoxed(instance, desc);
-            string label = ObjectNames.NicifyVariableName(desc.FieldName);
-
-            EditorGUI.BeginChangeCheck();
-            object newVal = currentVal;
-
-            if (desc.FieldType == typeof(float))
-            {
-                float v = currentVal is float fv ? fv : 0f;
-                newVal = EditorGUILayout.FloatField(label, v);
-            }
-            else if (desc.FieldType == typeof(int))
-            {
-                int v = currentVal is int iv ? iv : 0;
-                newVal = EditorGUILayout.IntField(label, v);
-            }
-            else if (desc.FieldType == typeof(bool))
-            {
-                bool v = currentVal is bool bv && bv;
-                newVal = EditorGUILayout.Toggle(label, v);
-            }
-            else if (desc.FieldType == typeof(string))
-            {
-                string v = currentVal as string ?? string.Empty;
-                newVal = EditorGUILayout.TextField(label, v);
-            }
-            else if (desc.FieldType == typeof(Vector2))
-            {
-                Vector2 v = currentVal is Vector2 v2 ? v2 : Vector2.zero;
-                newVal = EditorGUILayout.Vector2Field(label, v);
-            }
-            else if (desc.FieldType == typeof(Vector3))
-            {
-                Vector3 v = currentVal is Vector3 v3 ? v3 : Vector3.zero;
-                newVal = EditorGUILayout.Vector3Field(label, v);
-            }
-            else if (desc.FieldType == typeof(Color))
-            {
-                Color v = currentVal is Color c ? c : Color.white;
-                newVal = EditorGUILayout.ColorField(label, v);
-            }
-            else if (desc.FieldType != null && desc.FieldType.IsEnum)
-            {
-                Enum v = currentVal is Enum ev ? ev : (Enum)Activator.CreateInstance(desc.FieldType);
-                newVal = EditorGUILayout.EnumPopup(label, v);
-            }
-            else
-            {
-                EditorGUILayout.LabelField(label, currentVal != null ? currentVal.ToString() : "null");
-            }
-
-            if (EditorGUI.EndChangeCheck())
-            {
-                HotReloadStateStore.SetBoxed(instance, desc, newVal);
-            }
         }
     }
 }
