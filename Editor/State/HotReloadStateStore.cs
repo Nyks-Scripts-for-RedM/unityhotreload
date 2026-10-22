@@ -3,7 +3,9 @@
 
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using System.Runtime.CompilerServices;
+using UnityEngine;
 
 namespace Nyks.HotReload.Editor.State
 {
@@ -277,6 +279,104 @@ namespace Nyks.HotReload.Editor.State
                 _staticStore.Clear();
                 _typeDescriptors.Clear();
             }
+        }
+
+        internal static Action<MonoBehaviour, string, float, float, bool> OnScheduleDynamicInvoke;
+        internal static Action<MonoBehaviour, string> OnCancelDynamicInvoke;
+        internal static Func<MonoBehaviour, string, bool> OnCheckDynamicIsInvoking;
+
+        /// <summary>
+        /// Routes MonoBehaviour.Invoke calls so newly added Hot Reload methods execute on time without requiring a Domain Reload.
+        /// </summary>
+        public static void Invoke(MonoBehaviour instance, string methodName, float time)
+        {
+            if (instance == null || string.IsNullOrEmpty(methodName))
+            {
+                return;
+            }
+
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            if (instance.GetType().GetMethod(methodName, flags) != null)
+            {
+                instance.Invoke(methodName, time);
+                return;
+            }
+
+            OnScheduleDynamicInvoke?.Invoke(instance, methodName, time, 0f, false);
+        }
+
+        /// <summary>
+        /// Routes MonoBehaviour.InvokeRepeating calls so newly added Hot Reload methods repeat without requiring a Domain Reload.
+        /// </summary>
+        public static void InvokeRepeating(MonoBehaviour instance, string methodName, float time, float repeatRate)
+        {
+            if (instance == null || string.IsNullOrEmpty(methodName))
+            {
+                return;
+            }
+
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            if (instance.GetType().GetMethod(methodName, flags) != null)
+            {
+                instance.InvokeRepeating(methodName, time, repeatRate);
+                return;
+            }
+
+            OnScheduleDynamicInvoke?.Invoke(instance, methodName, time, repeatRate, true);
+        }
+
+        /// <summary>
+        /// Routes MonoBehaviour.CancelInvoke() calls to cancel both native and dynamic Hot Reload timers.
+        /// </summary>
+        public static void CancelInvoke(MonoBehaviour instance)
+        {
+            if (instance == null)
+            {
+                return;
+            }
+
+            instance.CancelInvoke();
+            OnCancelDynamicInvoke?.Invoke(instance, null);
+        }
+
+        /// <summary>
+        /// Routes MonoBehaviour.CancelInvoke(string) calls to cancel both native and dynamic Hot Reload timers.
+        /// </summary>
+        public static void CancelInvoke(MonoBehaviour instance, string methodName)
+        {
+            if (instance == null)
+            {
+                return;
+            }
+
+            instance.CancelInvoke(methodName);
+            OnCancelDynamicInvoke?.Invoke(instance, methodName);
+        }
+
+        /// <summary>
+        /// Routes MonoBehaviour.IsInvoking() calls to check both native and dynamic Hot Reload timers.
+        /// </summary>
+        public static bool IsInvoking(MonoBehaviour instance)
+        {
+            if (instance == null)
+            {
+                return false;
+            }
+
+            return instance.IsInvoking() || (OnCheckDynamicIsInvoking != null && OnCheckDynamicIsInvoking(instance, null));
+        }
+
+        /// <summary>
+        /// Routes MonoBehaviour.IsInvoking(string) calls to check both native and dynamic Hot Reload timers.
+        /// </summary>
+        public static bool IsInvoking(MonoBehaviour instance, string methodName)
+        {
+            if (instance == null)
+            {
+                return false;
+            }
+
+            return instance.IsInvoking(methodName) || (OnCheckDynamicIsInvoking != null && OnCheckDynamicIsInvoking(instance, methodName));
         }
     }
 }

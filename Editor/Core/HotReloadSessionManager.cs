@@ -78,8 +78,24 @@ namespace Nyks.HotReload.Editor.Core
             public IntPtr FunctionPointer;
         }
 
+        private sealed class DynamicScheduledInvoke
+        {
+            public MonoBehaviour Instance;
+            public string Key;
+            public string MethodName;
+            public double NextExecutionTime;
+            public float RepeatRate;
+            public bool IsRepeating;
+        }
+
         private static readonly Dictionary<string, DynamicLifecycleHook> _dynamicLifecycleHooks =
             new Dictionary<string, DynamicLifecycleHook>(StringComparer.Ordinal);
+
+        private static readonly Dictionary<string, DynamicLifecycleHook> _dynamicAddedMethods =
+            new Dictionary<string, DynamicLifecycleHook>(StringComparer.Ordinal);
+
+        private static readonly List<DynamicScheduledInvoke> _dynamicScheduledInvokes =
+            new List<DynamicScheduledInvoke>(16);
 
         private static readonly HashSet<string> _unityNativeMessagesRequiringReload = new HashSet<string>(StringComparer.Ordinal)
         {
@@ -231,6 +247,11 @@ namespace Nyks.HotReload.Editor.Core
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             EditorApplication.quitting += OnEditorQuitting;
+            Application.logMessageReceived += OnUnityLogMessageReceived;
+
+            HotReloadStateStore.OnScheduleDynamicInvoke = ScheduleDynamicInvoke;
+            HotReloadStateStore.OnCancelDynamicInvoke = CancelDynamicInvoke;
+            HotReloadStateStore.OnCheckDynamicIsInvoking = CheckDynamicIsInvoking;
 
             // Immediately lock kAutoRefresh preferences during InitializeOnLoad so IDE integrations
             // (e.g. VisualStudioIntegration / Rider) never trigger a parallel AssetDatabase.Refresh() after Domain Reload
@@ -320,10 +341,12 @@ namespace Nyks.HotReload.Editor.Core
         /// </summary>
         public static int RevertAllPatches()
         {
-            if (_dynamicLifecycleHooks.Count > 0)
+            if (_dynamicLifecycleHooks.Count > 0 || _dynamicAddedMethods.Count > 0 || _dynamicScheduledInvokes.Count > 0)
             {
                 Application.onBeforeRender -= OnBeforeRenderDynamicUpdates;
                 _dynamicLifecycleHooks.Clear();
+                _dynamicAddedMethods.Clear();
+                _dynamicScheduledInvokes.Clear();
             }
             int count = NativeMethodDetour.RevertAll();
             HotReloadStateStore.ClearAll();
@@ -575,10 +598,12 @@ namespace Nyks.HotReload.Editor.Core
         private static void OnBeforeAssemblyReload()
         {
             DisposeFileWatcher();
-            if (_dynamicLifecycleHooks.Count > 0)
+            if (_dynamicLifecycleHooks.Count > 0 || _dynamicAddedMethods.Count > 0 || _dynamicScheduledInvokes.Count > 0)
             {
                 Application.onBeforeRender -= OnBeforeRenderDynamicUpdates;
                 _dynamicLifecycleHooks.Clear();
+                _dynamicAddedMethods.Clear();
+                _dynamicScheduledInvokes.Clear();
             }
             NativeMethodDetour.ClearOnDomainUnload();
             HotReloadStateStore.ClearAll();
@@ -769,6 +794,11 @@ namespace Nyks.HotReload.Editor.Core
                         continue;
                     }
 
+                    if (patchMethod.IsDefined(typeof(System.Runtime.CompilerServices.CompilerGeneratedAttribute), false))
+                    {
+                        continue;
+                    }
+
                     MethodInfo originalMethod = FindMatchingOriginalMethod(originalType, patchMethod, flags);
                     if (originalMethod == null)
                     {
@@ -790,7 +820,15 @@ namespace Nyks.HotReload.Editor.Core
                                 LogDomainReloadAdvisoryOnce(
                                     $"NewUnityMsg:{originalType.FullName}.{patchMethod.Name}",
                                     $"New Unity lifecycle/physics callback '<b>{originalType.Name}.{patchMethod.Name}()</b>' was added to <b>{scriptName}</b>. " +
-                                    "Because this method did not exist when Unity last built its native C++ callback table, click <b>Tools > Hot Reload Pro > Full Domain Reload</b> once.");
+                                    "Because this method did not exist when Unity last built its native C++ callback table, click <b>Tools > Hot Reload Pro > Full Domain Reload</b> (or press <b>Ctrl+Shift+R</b>) once.");
+                                continue;
+                            }
+
+                            if (patchMethod.ReturnType == typeof(void) &&
+                                TryRegisterDynamicAddedMethod(originalType, patchMethod))
+                            {
+                                patchedCount++;
+                                patchedMethodNamesOut.Add($"{originalType.Name}.{patchMethod.Name} (Dynamic Method)");
                             }
                         }
                         continue;
@@ -921,9 +959,157 @@ namespace Nyks.HotReload.Editor.Core
             }
         }
 
+        private static unsafe bool TryRegisterDynamicAddedMethod(Type originalType, MethodInfo patchMethod)
+        {
+            try
+            {
+                System.Runtime.CompilerServices.RuntimeHelpers.PrepareMethod(patchMethod.MethodHandle);
+                IntPtr fnPtr = patchMethod.MethodHandle.GetFunctionPointer();
+                if (fnPtr == IntPtr.Zero)
+                {
+                    return false;
+                }
+
+                string key = $"{originalType.FullName}.{patchMethod.Name}";
+                _dynamicAddedMethods[key] = new DynamicLifecycleHook
+                {
+                    OriginalComponentType = originalType,
+                    MethodName = patchMethod.Name,
+                    FunctionPointer = fnPtr
+                };
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void ScheduleDynamicInvoke(MonoBehaviour instance, string methodName, float time, float repeatRate, bool isRepeating)
+        {
+            if (instance == null || string.IsNullOrEmpty(methodName))
+            {
+                return;
+            }
+
+            string key = $"{instance.GetType().FullName}.{methodName}";
+            double now = EditorApplication.isPlaying ? Time.timeAsDouble : EditorApplication.timeSinceStartup;
+
+            for (int i = 0; i < _dynamicScheduledInvokes.Count; i++)
+            {
+                DynamicScheduledInvoke existing = _dynamicScheduledInvokes[i];
+                if (ReferenceEquals(existing.Instance, instance) &&
+                    string.Equals(existing.MethodName, methodName, StringComparison.Ordinal))
+                {
+                    existing.NextExecutionTime = now + Math.Max(0f, time);
+                    existing.RepeatRate = repeatRate;
+                    existing.IsRepeating = isRepeating;
+                    return;
+                }
+            }
+
+            _dynamicScheduledInvokes.Add(new DynamicScheduledInvoke
+            {
+                Instance = instance,
+                Key = key,
+                MethodName = methodName,
+                NextExecutionTime = now + Math.Max(0f, time),
+                RepeatRate = repeatRate,
+                IsRepeating = isRepeating
+            });
+
+            Application.onBeforeRender -= OnBeforeRenderDynamicUpdates;
+            Application.onBeforeRender += OnBeforeRenderDynamicUpdates;
+        }
+
+        private static void CancelDynamicInvoke(MonoBehaviour instance, string methodName)
+        {
+            if (instance == null)
+            {
+                return;
+            }
+
+            for (int i = _dynamicScheduledInvokes.Count - 1; i >= 0; i--)
+            {
+                DynamicScheduledInvoke item = _dynamicScheduledInvokes[i];
+                if (item.Instance == null ||
+                    (ReferenceEquals(item.Instance, instance) &&
+                     (string.IsNullOrEmpty(methodName) || string.Equals(item.MethodName, methodName, StringComparison.Ordinal))))
+                {
+                    _dynamicScheduledInvokes.RemoveAt(i);
+                }
+            }
+        }
+
+        private static bool CheckDynamicIsInvoking(MonoBehaviour instance, string methodName)
+        {
+            if (instance == null)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < _dynamicScheduledInvokes.Count; i++)
+            {
+                DynamicScheduledInvoke item = _dynamicScheduledInvokes[i];
+                if (ReferenceEquals(item.Instance, instance) &&
+                    (string.IsNullOrEmpty(methodName) || string.Equals(item.MethodName, methodName, StringComparison.Ordinal)))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static unsafe void OnUnityLogMessageReceived(string condition, string stackTrace, LogType type)
+        {
+            // Intercept Unity's native C++ Invoke/InvokeRepeating failure message when a newly added method
+            // was invoked before a Domain Reload: "Trying to Invoke method: TypeName.MethodName couldn't be called."
+            const string prefix = "Trying to Invoke method: ";
+            const string suffix = " couldn't be called.";
+
+            if (string.IsNullOrEmpty(condition) ||
+                !condition.StartsWith(prefix, StringComparison.Ordinal) ||
+                !condition.EndsWith(suffix, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            string targetKey = condition.Substring(prefix.Length, condition.Length - prefix.Length - suffix.Length).Trim();
+            if (!_dynamicAddedMethods.TryGetValue(targetKey, out DynamicLifecycleHook hook) ||
+                hook == null || hook.OriginalComponentType == null || hook.FunctionPointer == IntPtr.Zero)
+            {
+                return;
+            }
+
+#pragma warning disable CS0618
+            UnityEngine.Object[] instances = UnityEngine.Object.FindObjectsOfType(hook.OriginalComponentType);
+#pragma warning restore CS0618
+            if (instances == null || instances.Length == 0)
+            {
+                return;
+            }
+
+            var fn = (delegate*<object, void>)hook.FunctionPointer;
+            for (int i = 0; i < instances.Length; i++)
+            {
+                if (instances[i] is MonoBehaviour mb && mb != null && mb.isActiveAndEnabled)
+                {
+                    try
+                    {
+                        fn(mb);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogException(ex, mb);
+                    }
+                }
+            }
+        }
+
         private static unsafe void OnBeforeRenderDynamicUpdates()
         {
-            if (!EditorApplication.isPlaying || _dynamicLifecycleHooks.Count == 0)
+            if (!EditorApplication.isPlaying ||
+                (_dynamicLifecycleHooks.Count == 0 && _dynamicScheduledInvokes.Count == 0))
             {
                 return;
             }
@@ -957,6 +1143,49 @@ namespace Nyks.HotReload.Editor.Core
                         {
                             Debug.LogException(ex, mb);
                         }
+                    }
+                }
+            }
+
+            if (_dynamicScheduledInvokes.Count > 0)
+            {
+                double now = Time.timeAsDouble;
+                for (int i = _dynamicScheduledInvokes.Count - 1; i >= 0; i--)
+                {
+                    DynamicScheduledInvoke item = _dynamicScheduledInvokes[i];
+                    if (item == null || item.Instance == null)
+                    {
+                        _dynamicScheduledInvokes.RemoveAt(i);
+                        continue;
+                    }
+
+                    if (now < item.NextExecutionTime)
+                    {
+                        continue;
+                    }
+
+                    if (_dynamicAddedMethods.TryGetValue(item.Key, out DynamicLifecycleHook hook) &&
+                        hook != null && hook.FunctionPointer != IntPtr.Zero &&
+                        item.Instance.isActiveAndEnabled)
+                    {
+                        var fn = (delegate*<object, void>)hook.FunctionPointer;
+                        try
+                        {
+                            fn(item.Instance);
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.LogException(ex, item.Instance);
+                        }
+                    }
+
+                    if (item.IsRepeating && item.RepeatRate > 0f)
+                    {
+                        item.NextExecutionTime = now + item.RepeatRate;
+                    }
+                    else
+                    {
+                        _dynamicScheduledInvokes.RemoveAt(i);
                     }
                 }
             }

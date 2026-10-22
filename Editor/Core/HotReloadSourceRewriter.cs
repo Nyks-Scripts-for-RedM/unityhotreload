@@ -143,13 +143,24 @@ namespace Nyks.HotReload.Editor.Core
                     }
                 }
 
-                sb.AppendLine(line);
-                braceDepth += openBraces - closeBraces;
-
-                if (insideClass && braceDepth < classBraceDepth && closeBraces > 0)
+                int nextBraceDepth = braceDepth + openBraces - closeBraces;
+                if (insideClass && nextBraceDepth < classBraceDepth && closeBraces > 0)
                 {
+                    if (primaryOriginalType != null &&
+                        typeof(UnityEngine.MonoBehaviour).IsAssignableFrom(primaryOriginalType))
+                    {
+                        sb.AppendLine("    [System.Runtime.CompilerServices.CompilerGenerated] private new void Invoke(string methodName, float time) => global::Nyks.HotReload.Editor.State.HotReloadStateStore.Invoke(this, methodName, time);");
+                        sb.AppendLine("    [System.Runtime.CompilerServices.CompilerGenerated] private new void InvokeRepeating(string methodName, float time, float repeatRate) => global::Nyks.HotReload.Editor.State.HotReloadStateStore.InvokeRepeating(this, methodName, time, repeatRate);");
+                        sb.AppendLine("    [System.Runtime.CompilerServices.CompilerGenerated] private new void CancelInvoke() => global::Nyks.HotReload.Editor.State.HotReloadStateStore.CancelInvoke(this);");
+                        sb.AppendLine("    [System.Runtime.CompilerServices.CompilerGenerated] private new void CancelInvoke(string methodName) => global::Nyks.HotReload.Editor.State.HotReloadStateStore.CancelInvoke(this, methodName);");
+                        sb.AppendLine("    [System.Runtime.CompilerServices.CompilerGenerated] private new bool IsInvoking() => global::Nyks.HotReload.Editor.State.HotReloadStateStore.IsInvoking(this);");
+                        sb.AppendLine("    [System.Runtime.CompilerServices.CompilerGenerated] private new bool IsInvoking(string methodName) => global::Nyks.HotReload.Editor.State.HotReloadStateStore.IsInvoking(this, methodName);");
+                    }
                     insideClass = false;
                 }
+
+                sb.AppendLine(line);
+                braceDepth = nextBraceDepth;
             }
 
             if (headerInsertIndex >= lines.Length)
