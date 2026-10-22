@@ -1,0 +1,25 @@
+{
+  "name": "com.nyks.unityhotreload",
+  "version": "1.0.0",
+  "displayName": "Nyks Hot Reload Pro",
+  "description": "Production-grade, zero-dependency C# Hot Reload engine for Unity 6+ and 2021.3+. Uses Warm In-Memory Roslyn compilation, DotNetSdk Roslyn fallback, Dynamic Virtual Field Store, and native x64/ARM64 JIT method detouring.",
+  "unity": "2021.3",
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Togan (nyks000)",
+    "url": "https://github.com/Nyks-Scripts-for-RedM/unityhotreload"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Nyks-Scripts-for-RedM/unityhotreload.git"
+  },
+  "keywords": [
+    "hot-reload",
+    "fast-script-reload",
+    "roslyn",
+    "jit",
+    "detour",
+    "editor",
+    "unity6"
+  ]
+}
