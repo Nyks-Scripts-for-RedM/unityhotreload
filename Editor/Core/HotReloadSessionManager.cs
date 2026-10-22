@@ -365,15 +365,31 @@ namespace Nyks.HotReload.Editor.Core
             _pendingFiles.Clear();
             _isPerformingFullReload = true;
             ReleaseAutoRefreshLock();
-            RevertAllPatches();
+
+            if (_dynamicLifecycleHooks.Count > 0 || _dynamicAddedMethods.Count > 0 || _dynamicScheduledInvokes.Count > 0)
+            {
+                Application.onBeforeRender -= OnBeforeRenderDynamicUpdates;
+                _dynamicLifecycleHooks.Clear();
+                _dynamicAddedMethods.Clear();
+                _dynamicScheduledInvokes.Clear();
+            }
+            NativeMethodDetour.ClearOnDomainUnload();
+            HotReloadStateStore.ClearAll();
 
             EditorApplication.delayCall += () =>
             {
                 AssetDatabase.Refresh(ImportAssetOptions.Default);
-                if (!EditorApplication.isCompiling)
+
+                // Wait one additional Editor tick so AssetDatabase.Refresh can start asynchronous Bee compilation first.
+                // Calling RequestScriptReload on the same frame as AssetDatabase.Refresh forces a redundant
+                // synchronous StopAssetImportingV2(ForceSynchronousImport | ForceDomainReload) stall.
+                EditorApplication.delayCall += () =>
                 {
-                    EditorUtility.RequestScriptReload();
-                }
+                    if (!EditorApplication.isCompiling && !EditorApplication.isUpdating)
+                    {
+                        EditorUtility.RequestScriptReload();
+                    }
+                };
             };
         }
 
