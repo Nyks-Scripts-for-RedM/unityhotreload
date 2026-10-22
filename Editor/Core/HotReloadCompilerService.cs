@@ -133,29 +133,11 @@ namespace Nyks.HotReload.Editor.Core
 
             string patchAssemblyName = $"NyksHotReload_Patch_{_patchSequenceId++}_{Guid.NewGuid().ToString("N").Substring(0, 6)}";
 
-            // Attempt Tier 1: Warm In-Memory Roslyn first for sub-60ms compilation
-            if (TryCompileInMemoryRoslyn(
-                patchAssemblyName,
-                scriptFilePath,
-                rewriteResult.RewrittenSource,
-                referencePaths,
-                defineSymbols,
-                out System.Reflection.Assembly inMemAssembly,
-                out List<CompilerDiagnosticEntry> inMemDiagnostics))
-            {
-                stopwatch.Stop();
-                result.Success = true;
-                result.CompiledAssembly = inMemAssembly;
-                result.EngineUsed = "Warm In-Memory Roslyn";
-                result.CompileTimeMs = stopwatch.Elapsed.TotalMilliseconds;
-                result.Diagnostics.AddRange(inMemDiagnostics);
-                return result;
-            }
-
-            // Attempt Tier 2: Unity 6 DotNetSdk Roslyn (csc.dll) which supports C# 10/11/12+
+            // Tier 1: Unity DotNetSdk Roslyn (csc.dll) out-of-process compiler.
+            // Zero memory footprint in the Unity Editor AppDomain, no AssemblyResolve hooks, and full C# 10/11/12+ support.
             if (TryCompileDotNetSdkCsc(
                 patchAssemblyName,
-                 rewriteResult.RewrittenSource,
+                rewriteResult.RewrittenSource,
                 referencePaths,
                 defineSymbols,
                 out System.Reflection.Assembly cscAssembly,
@@ -167,6 +149,27 @@ namespace Nyks.HotReload.Editor.Core
                 result.EngineUsed = "Unity DotNetSdk Roslyn (csc)";
                 result.CompileTimeMs = stopwatch.Elapsed.TotalMilliseconds;
                 result.Diagnostics.AddRange(cscDiagnostics);
+                return result;
+            }
+
+            // Tier 2 Fallback: Legacy In-Memory Roslyn only if DotNetSdk csc.dll is unavailable on this Unity installation
+            List<CompilerDiagnosticEntry> inMemDiagnostics = null;
+            if (!ResolveDotNetAndCscPaths(out _, out _) &&
+                TryCompileInMemoryRoslyn(
+                    patchAssemblyName,
+                    scriptFilePath,
+                    rewriteResult.RewrittenSource,
+                    referencePaths,
+                    defineSymbols,
+                    out System.Reflection.Assembly inMemAssembly,
+                    out inMemDiagnostics))
+            {
+                stopwatch.Stop();
+                result.Success = true;
+                result.CompiledAssembly = inMemAssembly;
+                result.EngineUsed = "In-Memory Roslyn";
+                result.CompileTimeMs = stopwatch.Elapsed.TotalMilliseconds;
+                result.Diagnostics.AddRange(inMemDiagnostics);
                 return result;
             }
 
@@ -195,18 +198,13 @@ namespace Nyks.HotReload.Editor.Core
         }
 
         /// <summary>
-        /// Pre-warms the in-memory Roslyn compiler and metadata reference cache so the first save is instantaneous.
+        /// Pre-resolves the bundled DotNetSdk compiler paths without loading any assemblies into the Unity Editor AppDomain.
         /// </summary>
         public static void WarmUp()
         {
             try
             {
-                EnsureInMemoryRoslynLoaded();
-                if (_roslynAvailable)
-                {
-                    CollectCompilationContext(null, out List<string> refs, out _, out _);
-                    GetOrCreateMetadataReferences(refs);
-                }
+                ResolveDotNetAndCscPaths(out _, out _);
             }
             catch
             {

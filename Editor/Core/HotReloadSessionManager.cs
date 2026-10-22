@@ -59,9 +59,11 @@ namespace Nyks.HotReload.Editor.Core
         private const string UNITY_PREF_AUTOREFRESH = "kAutoRefresh";
         private const string UNITY_PREF_AUTOREFRESH_MODE = "kAutoRefreshMode";
 
-        private const double DEBOUNCE_SECONDS = 0.10;
+        private const double DEBOUNCE_SECONDS = 0.08;
+        private const double POLL_INTERVAL_SECONDS = 0.30;
 
-        private static FileSystemWatcher _watcher;
+        private static readonly Dictionary<string, long> _scriptLastWriteTicks =
+            new Dictionary<string, long>(256, StringComparer.OrdinalIgnoreCase);
         private static readonly ConcurrentDictionary<string, double> _pendingFiles =
             new ConcurrentDictionary<string, double>(StringComparer.OrdinalIgnoreCase);
 
@@ -91,6 +93,9 @@ namespace Nyks.HotReload.Editor.Core
         };
 
         private static bool _autoRefreshLockedByUs;
+        private static bool _isPerformingFullReload;
+        private static bool _initialBaselineComplete;
+        private static double _lastPollTime;
         private static string _lastModifiedScriptPath;
         private static bool _warmedUp;
         private static double _startupTime;
@@ -185,50 +190,57 @@ namespace Nyks.HotReload.Editor.Core
         public static int PendingUncompiledScriptCount => _dirtyScriptsSinceDomainReload.Count;
         public static int QueuedFocusFileCount => _pendingFiles.Count;
 
-        static HotReloadSessionManager()
-        {
-            _startupTime = EditorApplication.timeSinceStartup;
-            EditorApplication.update += OnEditorUpdate;
-            Application.onBeforeRender += OnBeforeRenderDynamicUpdates;
-            EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
-            AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
-
-            EditorApplication.delayCall += () =>
-            {
-                ClearUnityPackageManagerSingletonNoise();
-                StartFileWatcher();
-                UpdateAutoRefreshLockState();
-            };
-        }
-
         /// <summary>
-        /// Clears the benign Unity 6 PackageManager 'ScriptableSingleton already exists' log noise after domain reload
-        /// without touching or destroying any native ScriptableSingleton instances.
+        /// Returns true when running inside Unity's background AssetImportWorker process or headless batchmode.
+        /// Hot Reload Pro must never start FileSystemWatchers or compilers inside background worker processes.
         /// </summary>
-        private static void ClearUnityPackageManagerSingletonNoise()
+        public static bool IsBackgroundWorkerOrBatchProcess()
         {
+            if (Application.isBatchMode)
+            {
+                return true;
+            }
+
             try
             {
-                Type logEntriesType = typeof(EditorApplication).Assembly.GetType("UnityEditor.LogEntries");
-                if (logEntriesType == null) return;
-
-                MethodInfo getCountMethod = logEntriesType.GetMethod("GetCount", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-                MethodInfo clearMethod = logEntriesType.GetMethod("Clear", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-
-                if (getCountMethod != null && clearMethod != null)
+                if (AssetDatabase.IsAssetImportWorkerProcess())
                 {
-                    int count = (int)getCountMethod.Invoke(null, null);
-                    // When only the 2 startup ScriptableSingleton messages are present right after reload, clear them
-                    if (count > 0 && count <= 3)
-                    {
-                        clearMethod.Invoke(null, null);
-                    }
+                    return true;
                 }
             }
             catch
             {
-                // Ignore reflection differences
+                // Ignore if unavailable on older Unity versions
             }
+
+            string cmd = Environment.CommandLine ?? string.Empty;
+            return cmd.IndexOf("AssetImportWorker", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   cmd.IndexOf("-batchmode", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   cmd.IndexOf("-noUpm", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        static HotReloadSessionManager()
+        {
+            if (IsBackgroundWorkerOrBatchProcess())
+            {
+                return;
+            }
+
+            _startupTime = EditorApplication.timeSinceStartup;
+            EditorApplication.update += OnEditorUpdate;
+            EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
+            AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
+            EditorApplication.quitting += OnBeforeAssemblyReload;
+
+            EditorApplication.delayCall += () =>
+            {
+                if (IsBackgroundWorkerOrBatchProcess())
+                {
+                    return;
+                }
+                StartFileWatcher();
+                UpdateAutoRefreshLockState();
+            };
         }
         /// <summary>
         /// Manually triggers compilation and hot-patching for the specified C# script path (works in both Edit Mode and Play Mode).
@@ -304,7 +316,11 @@ namespace Nyks.HotReload.Editor.Core
         /// </summary>
         public static int RevertAllPatches()
         {
-            _dynamicLifecycleHooks.Clear();
+            if (_dynamicLifecycleHooks.Count > 0)
+            {
+                Application.onBeforeRender -= OnBeforeRenderDynamicUpdates;
+                _dynamicLifecycleHooks.Clear();
+            }
             int count = NativeMethodDetour.RevertAll();
             HotReloadStateStore.ClearAll();
             OnStatusChanged?.Invoke();
@@ -313,18 +329,24 @@ namespace Nyks.HotReload.Editor.Core
 
         /// <summary>
         /// Unlocks Auto-Refresh and triggers a clean Unity AssetDatabase Refresh outside the IMGUI loop.
+        /// Never re-locks Auto-Refresh until the Domain Reload has completed.
         /// </summary>
         public static void ForceFullUnityReload()
         {
             _dirtyScriptsSinceDomainReload.Clear();
             _loggedReloadAdvisories.Clear();
+            _pendingFiles.Clear();
+            _isPerformingFullReload = true;
             ReleaseAutoRefreshLock();
             RevertAllPatches();
 
             EditorApplication.delayCall += () =>
             {
-                AssetDatabase.Refresh();
-                UpdateAutoRefreshLockState();
+                AssetDatabase.Refresh(ImportAssetOptions.Default);
+                if (!EditorApplication.isCompiling)
+                {
+                    EditorUtility.RequestScriptReload();
+                }
             };
         }
 
@@ -332,59 +354,98 @@ namespace Nyks.HotReload.Editor.Core
         {
             try
             {
-                DisposeFileWatcher();
-
+                _scriptLastWriteTicks.Clear();
                 string assetsPath = Application.dataPath;
                 if (!Directory.Exists(assetsPath))
                 {
                     return;
                 }
 
-                _watcher = new FileSystemWatcher(assetsPath, "*.cs")
+                foreach (string filePath in Directory.EnumerateFiles(assetsPath, "*.cs", SearchOption.AllDirectories))
                 {
-                    IncludeSubdirectories = true,
-                    NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size
-                };
-
-                _watcher.Created += OnFileChanged;
-                _watcher.Changed += OnFileChanged;
-                _watcher.Renamed += OnFileRenamed;
-                _watcher.EnableRaisingEvents = true;
+                    try
+                    {
+                        _scriptLastWriteTicks[filePath] = File.GetLastWriteTimeUtc(filePath).Ticks;
+                    }
+                    catch
+                    {
+                        // Ignore inaccessible files
+                    }
+                }
+                _initialBaselineComplete = true;
+                _lastPollTime = EditorApplication.timeSinceStartup;
             }
             catch (Exception ex)
             {
-                Debug.LogWarning($"[HotReloadPro] Failed to initialize FileSystemWatcher: {ex.Message}");
+                Debug.LogWarning($"[HotReloadPro] Failed to initialize script baseline: {ex.Message}");
             }
         }
 
         private static void DisposeFileWatcher()
         {
-            if (_watcher != null)
+            _scriptLastWriteTicks.Clear();
+            _pendingFiles.Clear();
+        }
+
+        private static void PollModifiedScriptsMainThread()
+        {
+            if (!_initialBaselineComplete || !IsEnabled || _isPerformingFullReload || EditorApplication.isCompiling || EditorApplication.isUpdating)
             {
-                try
-                {
-                    _watcher.EnableRaisingEvents = false;
-                    _watcher.Created -= OnFileChanged;
-                    _watcher.Changed -= OnFileChanged;
-                    _watcher.Renamed -= OnFileRenamed;
-                    _watcher.Dispose();
-                }
-                catch
-                {
-                    // Ignore dispose exceptions
-                }
-                _watcher = null;
+                return;
             }
-        }
 
-        private static void OnFileChanged(object sender, FileSystemEventArgs e)
-        {
-            QueueScriptChange(e.FullPath);
-        }
+            if (EditorApplication.timeSinceStartup - _lastPollTime < POLL_INTERVAL_SECONDS)
+            {
+                return;
+            }
+            _lastPollTime = EditorApplication.timeSinceStartup;
 
-        private static void OnFileRenamed(object sender, RenamedEventArgs e)
-        {
-            QueueScriptChange(e.FullPath);
+            string assetsPath = Application.dataPath;
+            if (string.IsNullOrEmpty(assetsPath) || !Directory.Exists(assetsPath))
+            {
+                return;
+            }
+
+            try
+            {
+                foreach (string filePath in Directory.EnumerateFiles(assetsPath, "*.cs", SearchOption.AllDirectories))
+                {
+                    string fileName = Path.GetFileName(filePath);
+                    if (fileName.StartsWith(".", StringComparison.Ordinal) || fileName.EndsWith("~", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    long currentTicks;
+                    try
+                    {
+                        currentTicks = File.GetLastWriteTimeUtc(filePath).Ticks;
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (_scriptLastWriteTicks.TryGetValue(filePath, out long previousTicks))
+                    {
+                        if (currentTicks > previousTicks)
+                        {
+                            _scriptLastWriteTicks[filePath] = currentTicks;
+                            QueueScriptChange(filePath);
+                        }
+                    }
+                    else
+                    {
+                        // Newly created script file: record baseline and let Unity register new MonoScript if in Edit Mode
+                        _scriptLastWriteTicks[filePath] = currentTicks;
+                        QueueScriptChange(filePath);
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore transient file system enumeration errors
+            }
         }
 
         private static void QueueScriptChange(string fullPath)
@@ -410,12 +471,19 @@ namespace Nyks.HotReload.Editor.Core
 
         private static void OnEditorUpdate()
         {
-            // Warm up Roslyn in background 1.0s after Editor domain reload
+            if (_isPerformingFullReload)
+            {
+                return;
+            }
+
+            // Pre-resolve DotNetSdk paths 1.0s after Editor domain reload
             if (!_warmedUp && EditorApplication.timeSinceStartup - _startupTime > 1.0)
             {
                 _warmedUp = true;
                 HotReloadCompilerService.WarmUp();
             }
+
+            PollModifiedScriptsMainThread();
 
             if (_pendingFiles.IsEmpty)
             {
@@ -508,6 +576,11 @@ namespace Nyks.HotReload.Editor.Core
 
         private static void UpdateAutoRefreshLockState()
         {
+            if (_isPerformingFullReload || EditorApplication.isCompiling || EditorApplication.isUpdating)
+            {
+                return;
+            }
+
             bool shouldDisableAutoRefreshPref = IsEnabled && LockPlayModeAutoRefresh &&
                                                 (EditorApplication.isPlayingOrWillChangePlaymode || AllowEditModePatching);
 
@@ -808,6 +881,8 @@ namespace Nyks.HotReload.Editor.Core
                     MethodName = patchMethod.Name,
                     FunctionPointer = fnPtr
                 };
+                Application.onBeforeRender -= OnBeforeRenderDynamicUpdates;
+                Application.onBeforeRender += OnBeforeRenderDynamicUpdates;
                 return true;
             }
             catch

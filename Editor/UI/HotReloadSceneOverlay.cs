@@ -24,6 +24,11 @@ namespace Nyks.HotReload.Editor.UI
 
         static HotReloadSceneOverlay()
         {
+            if (HotReloadSessionManager.IsBackgroundWorkerOrBatchProcess())
+            {
+                return;
+            }
+
             HotReloadSessionManager.OnPatchApplied += OnPatchApplied;
             SceneView.duringSceneGui += OnDuringSceneGui;
             UnityEditor.Editor.finishedDefaultHeaderGUI += OnInspectorHeaderGui;
