@@ -230,7 +230,11 @@ namespace Nyks.HotReload.Editor.Core
             EditorApplication.update += OnEditorUpdate;
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
-            EditorApplication.quitting += OnBeforeAssemblyReload;
+            EditorApplication.quitting += OnEditorQuitting;
+
+            // Immediately lock kAutoRefresh preferences during InitializeOnLoad so IDE integrations
+            // (e.g. VisualStudioIntegration / Rider) never trigger a parallel AssetDatabase.Refresh() after Domain Reload
+            UpdateAutoRefreshLockState();
 
             EditorApplication.delayCall += () =>
             {
@@ -481,6 +485,7 @@ namespace Nyks.HotReload.Editor.Core
             {
                 _warmedUp = true;
                 HotReloadCompilerService.WarmUp();
+                UpdateAutoRefreshLockState();
             }
 
             PollModifiedScriptsMainThread();
@@ -570,13 +575,30 @@ namespace Nyks.HotReload.Editor.Core
         private static void OnBeforeAssemblyReload()
         {
             DisposeFileWatcher();
-            RevertAllPatches();
+            if (_dynamicLifecycleHooks.Count > 0)
+            {
+                Application.onBeforeRender -= OnBeforeRenderDynamicUpdates;
+                _dynamicLifecycleHooks.Clear();
+            }
+            NativeMethodDetour.ClearOnDomainUnload();
+            HotReloadStateStore.ClearAll();
+
+            if (_autoRefreshLockedByUs)
+            {
+                AssetDatabase.AllowAutoRefresh();
+                _autoRefreshLockedByUs = false;
+            }
+        }
+
+        private static void OnEditorQuitting()
+        {
+            OnBeforeAssemblyReload();
             ReleaseAutoRefreshLock();
         }
 
         private static void UpdateAutoRefreshLockState()
         {
-            if (_isPerformingFullReload || EditorApplication.isCompiling || EditorApplication.isUpdating)
+            if (_isPerformingFullReload)
             {
                 return;
             }
@@ -588,15 +610,22 @@ namespace Nyks.HotReload.Editor.Core
             {
                 if (!EditorPrefs.HasKey(PREF_SAVED_UNITY_AUTOREFRESH))
                 {
-                    EditorPrefs.SetInt(PREF_SAVED_UNITY_AUTOREFRESH, EditorPrefs.GetInt(UNITY_PREF_AUTOREFRESH, 1));
+                    EditorPrefs.SetInt(PREF_SAVED_UNITY_AUTOREFRESH, EditorPrefs.GetInt(UNITY_PREF_AUTOREFRESH_MODE, 1));
                 }
-                // Use Unity's official Auto-Refresh preference (0 = Disabled) so creating folders/assets in Edit Mode never deadlocks AssetImportWorker
+                // Set both kAutoRefresh (bool/int) and kAutoRefreshMode (0 = Disabled) so neither Unity nor IDE packages
+                // (e.g. com.unity.ide.visualstudio / com.unity.ide.rider) trigger an unwanted AssetDatabase.Refresh() on Ctrl+S
+                EditorPrefs.SetBool(UNITY_PREF_AUTOREFRESH, false);
                 EditorPrefs.SetInt(UNITY_PREF_AUTOREFRESH, 0);
                 EditorPrefs.SetInt(UNITY_PREF_AUTOREFRESH_MODE, 0);
             }
             else
             {
                 RestoreAutoRefreshPref();
+            }
+
+            if (EditorApplication.isCompiling || EditorApplication.isUpdating)
+            {
+                return;
             }
 
             // Only use C++ AssetDatabase.DisallowAutoRefresh() during active Play Mode
@@ -628,6 +657,7 @@ namespace Nyks.HotReload.Editor.Core
             if (EditorPrefs.HasKey(PREF_SAVED_UNITY_AUTOREFRESH))
             {
                 int saved = EditorPrefs.GetInt(PREF_SAVED_UNITY_AUTOREFRESH, 1);
+                EditorPrefs.SetBool(UNITY_PREF_AUTOREFRESH, saved != 0);
                 EditorPrefs.SetInt(UNITY_PREF_AUTOREFRESH, saved);
                 EditorPrefs.SetInt(UNITY_PREF_AUTOREFRESH_MODE, saved);
                 EditorPrefs.DeleteKey(PREF_SAVED_UNITY_AUTOREFRESH);

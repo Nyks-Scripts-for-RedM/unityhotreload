@@ -494,8 +494,7 @@ namespace Nyks.HotReload.Editor.Core
                     }
 
                     byte[] peBytes = peStream.ToArray();
-                    byte[] pdbBytes = pdbStream.ToArray();
-                    compiledAssembly = System.Reflection.Assembly.Load(peBytes, pdbBytes);
+                    compiledAssembly = System.Reflection.Assembly.Load(peBytes);
                     return compiledAssembly != null;
                 }
             }
@@ -527,13 +526,12 @@ namespace Nyks.HotReload.Editor.Core
                 return false;
             }
 
-            string tempDir = Path.Combine( Path.GetTempPath(), "NyksHotReload");
+            string tempDir = Path.Combine(Path.GetTempPath(), "NyksHotReload");
             Directory.CreateDirectory(tempDir);
 
             string srcFile = Path.Combine(tempDir, $"{assemblyName}.cs");
             string rspFile = Path.Combine(tempDir, $"{assemblyName}.rsp");
             string outDll = Path.Combine(tempDir, $"{assemblyName}.dll");
-            string outPdb = Path.Combine(tempDir, $"{assemblyName}.pdb");
 
             try
             {
@@ -542,14 +540,14 @@ namespace Nyks.HotReload.Editor.Core
                 var rsp = new StringBuilder(16384);
                 rsp.AppendLine("-target:library");
                 rsp.AppendLine("-nostdlib+");
-                rsp.AppendLine("-noconfig");
                 rsp.AppendLine("-unsafe+");
                 rsp.AppendLine("-optimize-");
-                rsp.AppendLine("-debug:portable");
+                rsp.AppendLine("-debug-");
+                rsp.AppendLine("-utf8output");
+                rsp.AppendLine("-preferreduilang:en-US");
                 rsp.AppendLine("-langversion:latest");
                 rsp.AppendLine("-nowarn:0436,0169,0649,0414,1701,1702");
                 rsp.AppendLine($"-out:\"{outDll}\"");
-                rsp.AppendLine($"-pdb:\"{outPdb}\"");
 
                 foreach (string def in defineSymbols)
                 {
@@ -573,7 +571,7 @@ namespace Nyks.HotReload.Editor.Core
                 var psi = new ProcessStartInfo
                 {
                     FileName = dotnetExe,
-                    Arguments = $"exec \"{cscDll}\" @\"{rspFile}\"",
+                    Arguments = $"exec \"{cscDll}\" -noconfig @\"{rspFile}\"",
                     CreateNoWindow = true,
                     UseShellExecute = false,
                     RedirectStandardOutput = true,
@@ -596,10 +594,7 @@ namespace Nyks.HotReload.Editor.Core
                     }
 
                     byte[] peBytes = File.ReadAllBytes(outDll);
-                    byte[] pdbBytes = File.Exists(outPdb) ? File.ReadAllBytes(outPdb) : null;
-                    compiledAssembly = pdbBytes != null
-                        ? System.Reflection.Assembly.Load(peBytes, pdbBytes)
-                        : System.Reflection.Assembly.Load(peBytes);
+                    compiledAssembly = System.Reflection.Assembly.Load(peBytes);
 
                     return compiledAssembly != null;
                 }
@@ -619,7 +614,6 @@ namespace Nyks.HotReload.Editor.Core
                 TryDeleteFile(srcFile);
                 TryDeleteFile(rspFile);
                 TryDeleteFile(outDll);
-                TryDeleteFile(outPdb);
             }
         }
 
@@ -781,6 +775,8 @@ namespace Nyks.HotReload.Editor.Core
             definesSet.Add("DEBUG");
             definesSet.Add("TRACE");
 
+            var pipelineRefCandidates = new List<string>(256);
+
             // Check Unity CompilationPipeline for the owning assembly's exact defines & references
             try
             {
@@ -794,6 +790,22 @@ namespace Nyks.HotReload.Editor.Core
                     if (!string.IsNullOrEmpty(uAsm.name))
                     {
                         projectAssemblyNames.Add(uAsm.name);
+                    }
+
+                    if (!string.IsNullOrEmpty(uAsm.outputPath))
+                    {
+                        pipelineRefCandidates.Add(uAsm.outputPath);
+                    }
+
+                    if (uAsm.compiledAssemblyReferences != null)
+                    {
+                        foreach (string compRef in uAsm.compiledAssemblyReferences)
+                        {
+                            if (!string.IsNullOrEmpty(compRef))
+                            {
+                                pipelineRefCandidates.Add(compRef);
+                            }
+                        }
                     }
 
                     if (normalizedScript != null && uAsm.sourceFiles != null)
@@ -828,7 +840,7 @@ namespace Nyks.HotReload.Editor.Core
 
             defineSymbols.AddRange(definesSet);
 
-            // Collect loaded AppDomain assemblies AND CompilationPipeline output assemblies, deduplicating by file name
+            // Collect loaded AppDomain assemblies, CompilationPipeline references, and plugin DLLs, deduplicating by file name
             var seenFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var seenFullPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var collectedRefs = referencePaths;
@@ -844,7 +856,9 @@ namespace Nyks.HotReload.Editor.Core
                 string fileName = Path.GetFileName(full);
 
                 if (fileName.StartsWith("NyksHotReload_Patch_", StringComparison.OrdinalIgnoreCase) ||
-                    fileName.StartsWith("Microsoft.CodeAnalysis", StringComparison.OrdinalIgnoreCase))
+                    fileName.StartsWith("Microsoft.CodeAnalysis", StringComparison.OrdinalIgnoreCase) ||
+                    full.IndexOf("NetStandard\\ref\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    full.IndexOf("NetStandard/ref/", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
                     return;
                 }
@@ -876,6 +890,18 @@ namespace Nyks.HotReload.Editor.Core
                 }
             }
 
+            foreach (string pipeRef in pipelineRefCandidates)
+            {
+                try
+                {
+                    TryAddReferencePath(pipeRef);
+                }
+                catch
+                {
+                    continue;
+                }
+            }
+
             try
             {
                 string scriptAssembliesDir = Path.GetFullPath("Library/ScriptAssemblies");
@@ -890,6 +916,22 @@ namespace Nyks.HotReload.Editor.Core
             catch
             {
                 // Ignore if Library/ScriptAssemblies is inaccessible
+            }
+
+            try
+            {
+                string assetsPath = UnityEngine.Application.dataPath;
+                if (!string.IsNullOrEmpty(assetsPath) && Directory.Exists(assetsPath))
+                {
+                    foreach (string pluginDll in Directory.GetFiles(assetsPath, "*.dll", SearchOption.AllDirectories))
+                    {
+                        TryAddReferencePath(pluginDll);
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore if plugin DLL enumeration fails
             }
         }
 

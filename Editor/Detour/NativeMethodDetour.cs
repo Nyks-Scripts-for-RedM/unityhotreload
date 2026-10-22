@@ -224,6 +224,18 @@ namespace Nyks.HotReload.Editor.Detour
             return reverted;
         }
 
+        /// <summary>
+        /// Clears tracked detour records when the Mono AppDomain is about to be unloaded by Unity,
+        /// without invoking VirtualProtect or modifying JIT pages that are being freed.
+        /// </summary>
+        public static void ClearOnDomainUnload()
+        {
+            lock (_syncRoot)
+            {
+                _activeDetours.Clear();
+            }
+        }
+
         private static void PrepareMethodSafe(MethodBase method)
         {
             Type declaringType = method.DeclaringType;

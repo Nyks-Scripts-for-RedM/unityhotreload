@@ -43,6 +43,8 @@ namespace Nyks.HotReload.Editor.UI
 
             _activeToastEvent = evt;
             _toastStartTime = EditorApplication.timeSinceStartup;
+            EditorApplication.update -= OnOverlayUpdate;
+            EditorApplication.update += OnOverlayUpdate;
             SceneView.RepaintAll();
 
             // Also show brief notification in focused GameView if playing
@@ -63,9 +65,31 @@ namespace Nyks.HotReload.Editor.UI
             }
         }
 
+        private static void OnOverlayUpdate()
+        {
+            if (_activeToastEvent == null)
+            {
+                EditorApplication.update -= OnOverlayUpdate;
+                return;
+            }
+
+            double elapsed = EditorApplication.timeSinceStartup - _toastStartTime;
+            if (elapsed > TOAST_DURATION_SECONDS)
+            {
+                _activeToastEvent = null;
+                EditorApplication.update -= OnOverlayUpdate;
+                SceneView.RepaintAll();
+            }
+        }
+
         private static void OnDuringSceneGui(SceneView sceneView)
         {
             if (_activeToastEvent == null)
+            {
+                return;
+            }
+
+            if (Event.current != null && Event.current.type != EventType.Repaint)
             {
                 return;
             }
@@ -77,11 +101,7 @@ namespace Nyks.HotReload.Editor.UI
                 return;
             }
 
-            float alpha = 1f;
-            if (elapsed > TOAST_DURATION_SECONDS - 0.6)
-            {
-                alpha = Mathf.Clamp01((float)((TOAST_DURATION_SECONDS - elapsed) / 0.6));
-            }
+            const float alpha = 1f;
 
             Handles.BeginGUI();
 
@@ -132,8 +152,6 @@ namespace Nyks.HotReload.Editor.UI
 
             GUI.color = prevColor;
             Handles.EndGUI();
-
-            sceneView.Repaint();
         }
 
         private static void OnInspectorHeaderGui(UnityEditor.Editor editor)
