@@ -277,16 +277,16 @@ namespace Nyks.HotReload.Editor.Core
                     if (isStatic)
                     {
                         propBuilder.Append(
-                            $"{indent}{cleanMods} {typeName} {varName} {{ " +
-                            $"get => global::Nyks.HotReload.Editor.State.HotReloadStateStore.GetStatic<{typeName}>(\"{fieldKey}\", {defaultExpr}); " +
-                            $"set => global::Nyks.HotReload.Editor.State.HotReloadStateStore.SetStatic<{typeName}>(\"{fieldKey}\", value); }}");
+                            $"{indent}[System.Runtime.CompilerServices.CompilerGenerated] {cleanMods} {typeName} {varName} {{ " +
+                            $"[System.Runtime.CompilerServices.CompilerGenerated] get => global::Nyks.HotReload.Editor.State.HotReloadStateStore.GetStatic<{typeName}>(\"{fieldKey}\", {defaultExpr}); " +
+                            $"[System.Runtime.CompilerServices.CompilerGenerated] set => global::Nyks.HotReload.Editor.State.HotReloadStateStore.SetStatic<{typeName}>(\"{fieldKey}\", value); }}");
                     }
                     else
                     {
                         propBuilder.Append(
-                            $"{indent}{cleanMods} {typeName} {varName} {{ " +
-                            $"get => global::Nyks.HotReload.Editor.State.HotReloadStateStore.Get<{typeName}>(this, \"{fieldKey}\", {defaultExpr}); " +
-                            $"set => global::Nyks.HotReload.Editor.State.HotReloadStateStore.Set<{typeName}>(this, \"{fieldKey}\", value); }}");
+                            $"{indent}[System.Runtime.CompilerServices.CompilerGenerated] {cleanMods} {typeName} {varName} {{ " +
+                            $"[System.Runtime.CompilerServices.CompilerGenerated] get => global::Nyks.HotReload.Editor.State.HotReloadStateStore.Get<{typeName}>(this, \"{fieldKey}\", {defaultExpr}); " +
+                            $"[System.Runtime.CompilerServices.CompilerGenerated] set => global::Nyks.HotReload.Editor.State.HotReloadStateStore.Set<{typeName}>(this, \"{fieldKey}\", value); }}");
                     }
 
                     Type resolvedFieldType = ResolvePrimitiveOrUnityType(typeName);
@@ -366,7 +366,6 @@ namespace Nyks.HotReload.Editor.Core
                     sb.Append("[assembly: System.Runtime.CompilerServices.IgnoresAccessChecksTo(\"").Append(asmName).Append("\")] ");
                 }
             }
-            sb.AppendLine();
         }
 
         private static int CountChar(string line, char target)

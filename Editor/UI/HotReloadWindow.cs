@@ -238,7 +238,7 @@ namespace Nyks.HotReload.Editor.UI
                 EditorGUILayout.BeginVertical(EditorStyles.helpBox);
 
                 EditorGUILayout.BeginHorizontal();
-                string icon = evt.Success ? "✅" : "❌";
+                string icon = !evt.Success ? "❌" : (evt.RequiresDomainReload ? "⚠️" : "✅");
                 string header = $"{icon} [{evt.TimestampLocal:HH:mm:ss}]  {evt.ScriptName}  —  {evt.TotalTimeMs:F0} ms ({evt.CompilerEngine})";
 
                 bool isExpanded = _expandedEvents.Contains(i);

@@ -53,10 +53,12 @@ namespace Nyks.HotReload.Editor.UI
                 if (EditorWindow.focusedWindow != null &&
                     EditorWindow.focusedWindow.GetType().Name == "GameView")
                 {
-                    string msg = evt.Success
-                        ? $"⚡ Hot Reloaded: {evt.ScriptName} ({evt.TotalTimeMs:F0}ms)"
-                        : $"❌ Hot Reload Compile Error: {evt.ScriptName}";
-                    EditorWindow.focusedWindow.ShowNotification(new GUIContent(msg), 1.8);
+                    string msg = !evt.Success
+                        ? $"❌ Hot Reload Compile Error: {evt.ScriptName}"
+                        : (evt.RequiresDomainReload
+                            ? $"⚠️ Full Reload Needed ({evt.ScriptName}): {evt.ReloadReason}"
+                            : $"⚡ Hot Reloaded: {evt.ScriptName} ({evt.TotalTimeMs:F0}ms)");
+                    EditorWindow.focusedWindow.ShowNotification(new GUIContent(msg), 2.2);
                 }
             }
             catch
@@ -106,9 +108,11 @@ namespace Nyks.HotReload.Editor.UI
             Handles.BeginGUI();
 
             Color prevColor = GUI.color;
-            Color bgTint = _activeToastEvent.Success
-                ? new Color(0.08f, 0.22f, 0.14f, 0.92f * alpha)
-                : new Color(0.28f, 0.10f, 0.10f, 0.92f * alpha);
+            Color bgTint = !_activeToastEvent.Success
+                ? new Color(0.28f, 0.10f, 0.10f, 0.92f * alpha)
+                : (_activeToastEvent.RequiresDomainReload
+                    ? new Color(0.26f, 0.20f, 0.06f, 0.92f * alpha)
+                    : new Color(0.08f, 0.22f, 0.14f, 0.92f * alpha));
 
             const float width = 340f;
             const float height = 54f;
@@ -121,9 +125,11 @@ namespace Nyks.HotReload.Editor.UI
 
             EditorGUI.DrawRect(boxRect, bgTint);
 
-            Color borderTint = _activeToastEvent.Success
-                ? new Color(0.29f, 0.87f, 0.50f, alpha)
-                : new Color(0.97f, 0.44f, 0.44f, alpha);
+            Color borderTint = !_activeToastEvent.Success
+                ? new Color(0.97f, 0.44f, 0.44f, alpha)
+                : (_activeToastEvent.RequiresDomainReload
+                    ? new Color(0.98f, 0.75f, 0.14f, alpha)
+                    : new Color(0.29f, 0.87f, 0.50f, alpha));
 
             EditorGUI.DrawRect(new Rect(boxRect.x, boxRect.y, 4f, boxRect.height), borderTint);
 
@@ -139,13 +145,17 @@ namespace Nyks.HotReload.Editor.UI
                 normal = { textColor = new Color(0.82f, 0.88f, 0.85f, alpha) }
             };
 
-            string title = _activeToastEvent.Success
-                ? $"⚡ Hot Reloaded: {_activeToastEvent.ScriptName} ({_activeToastEvent.TotalTimeMs:F0}ms)"
-                : $"❌ Compile Error: {_activeToastEvent.ScriptName}";
+            string title = !_activeToastEvent.Success
+                ? $"❌ Compile Error: {_activeToastEvent.ScriptName}"
+                : (_activeToastEvent.RequiresDomainReload
+                    ? $"⚠️ Full Reload Needed: {_activeToastEvent.ScriptName}"
+                    : $"⚡ Hot Reloaded: {_activeToastEvent.ScriptName} ({_activeToastEvent.TotalTimeMs:F0}ms)");
 
-            string subtitle = _activeToastEvent.Success
-                ? $"{_activeToastEvent.PatchedMethods.Count} methods patched • {_activeToastEvent.AddedFields.Count} dynamic fields"
-                : (_activeToastEvent.Diagnostics.Count > 0 ? _activeToastEvent.Diagnostics[0].Message : "Check Console / Hot Reload Pro window");
+            string subtitle = !_activeToastEvent.Success
+                ? (_activeToastEvent.Diagnostics.Count > 0 ? _activeToastEvent.Diagnostics[0].Message : "Check Console / Hot Reload Pro window")
+                : (_activeToastEvent.RequiresDomainReload
+                    ? $"{_activeToastEvent.ReloadReason} (Press Ctrl+Alt+R)"
+                    : $"{_activeToastEvent.PatchedMethods.Count} methods patched • {_activeToastEvent.AddedFields.Count} dynamic fields");
 
             GUI.Label(new Rect(boxRect.x + 12f, boxRect.y + 8f, boxRect.width - 20f, 20f), title, titleStyle);
             GUI.Label(new Rect(boxRect.x + 12f, boxRect.y + 28f, boxRect.width - 20f, 18f), subtitle, subStyle);

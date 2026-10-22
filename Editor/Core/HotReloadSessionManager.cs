@@ -35,6 +35,8 @@ namespace Nyks.HotReload.Editor.Core
         public string ScriptName { get; set; }
         public string ScriptPath { get; set; }
         public bool Success { get; set; }
+        public bool RequiresDomainReload { get; set; }
+        public string ReloadReason { get; set; }
         public double TotalTimeMs { get; set; }
         public string CompilerEngine { get; set; }
         public List<string> PatchedMethods { get; } = new List<string>();
@@ -51,7 +53,7 @@ namespace Nyks.HotReload.Editor.Core
     {
         private const string PREF_ENABLED = "Nyks.HotReload.IsEnabled";
         private const string PREF_LOCK_DOMAIN_RELOAD = "Nyks.HotReload.LockDomainReload";
-        private const string PREF_ALLOW_EDITMODE = "Nyks.HotReload.AllowEditModePatch_v2";
+        private const string PREF_ALLOW_EDITMODE = "Nyks.HotReload.AllowEditModePatch_v3";
         private const string PREF_SHOW_TOAST = "Nyks.HotReload.ShowToast";
         private const string PREF_TRIGGER_MODE = "Nyks.HotReload.TriggerMode";
         private const string PREF_SAVED_UNITY_AUTOREFRESH = "Nyks.HotReload.SavedUnityAutoRefresh";
@@ -99,7 +101,7 @@ namespace Nyks.HotReload.Editor.Core
 
         private static readonly HashSet<string> _unityNativeMessagesRequiringReload = new HashSet<string>(StringComparer.Ordinal)
         {
-            "Awake", "OnEnable", "OnDisable", "OnDestroy",
+            "Awake", "Start", "OnEnable", "OnDisable", "OnDestroy",
             "OnTriggerEnter", "OnTriggerStay", "OnTriggerExit",
             "OnTriggerEnter2D", "OnTriggerStay2D", "OnTriggerExit2D",
             "OnCollisionEnter", "OnCollisionStay", "OnCollisionExit",
@@ -154,14 +156,15 @@ namespace Nyks.HotReload.Editor.Core
         }
 
         /// <summary>
-        /// Enabled by default so saving scripts outside Play Mode (in Edit Mode) also compiles & hot-patches immediately without Domain Reload.
+        /// When false (default), Edit Mode uses Unity's standard compilation so new classes, interfaces, and serialized fields
+        /// work out-of-the-box, while Play Mode automatically locks Domain Reload and hot-patches live changes.
         /// </summary>
         public static bool AllowEditModePatching
         {
-            get => EditorPrefs.GetBool(PREF_ALLOW_EDITMODE, true);
+            get => EditorPrefs.GetBool(PREF_ALLOW_EDITMODE, false);
             set
             {
-                if (EditorPrefs.GetBool(PREF_ALLOW_EDITMODE, true) != value)
+                if (EditorPrefs.GetBool(PREF_ALLOW_EDITMODE, false) != value)
                 {
                     EditorPrefs.SetBool(PREF_ALLOW_EDITMODE, value);
                     UpdateAutoRefreshLockState();
@@ -309,6 +312,8 @@ namespace Nyks.HotReload.Editor.Core
 
                     if (addedField.RequiresUnityObjectSerialization)
                     {
+                        evt.RequiresDomainReload = true;
+                        evt.ReloadReason = $"New serialized reference field '{addedField.DeclaredTypeName} {addedField.FieldName}'";
                         LogDomainReloadAdvisoryOnce(
                             $"SerializedRef:{addedField.FieldKey}",
                             $"New serialized reference field (<b>{addedField.DeclaredTypeName} {addedField.FieldName}</b>) detected in <b>{evt.ScriptName}</b>. " +
@@ -317,13 +322,40 @@ namespace Nyks.HotReload.Editor.Core
                 }
             }
 
-            int patchedCount = ApplyAssemblyDetours(compileResult.CompiledAssembly, evt.ScriptName, evt.PatchedMethods, evt.Diagnostics);
+            int patchedCount = ApplyAssemblyDetours(
+                compileResult.CompiledAssembly,
+                evt.ScriptName,
+                evt.PatchedMethods,
+                evt.Diagnostics,
+                out bool detourRequiresReload,
+                out string detourReloadReason);
+
+            if (detourRequiresReload)
+            {
+                evt.RequiresDomainReload = true;
+                if (string.IsNullOrEmpty(evt.ReloadReason))
+                {
+                    evt.ReloadReason = detourReloadReason;
+                }
+            }
 
             totalSw.Stop();
             evt.Success = true;
             evt.TotalTimeMs = totalSw.Elapsed.TotalMilliseconds;
 
-            if (patchedCount > 0 || evt.AddedFields.Count > 0)
+            // If we are in Edit Mode (not playing) and the user made a structural change
+            // (e.g. added `: ICollectible`, added a new class, added a new public/interface method, or added OnTriggerEnter),
+            // automatically trigger a clean Unity compilation so the user never has to manually click Full Reload!
+            if (!EditorApplication.isPlaying && evt.RequiresDomainReload)
+            {
+                Debug.Log(
+                    $"<color=#38BDF8><b>[⚡ Hot Reload Pro • Edit Mode]</b></color> Structural change detected in <b>{evt.ScriptName}</b> ({evt.ReloadReason}). " +
+                    "Automatically syncing with Unity compiler...");
+                ForceFullUnityReload();
+                return evt;
+            }
+
+            if (patchedCount > 0 || evt.AddedFields.Count > 0 || evt.RequiresDomainReload)
             {
                 _dirtyScriptsSinceDomainReload.Add(scriptPath);
                 RecordEvent(evt);
@@ -373,23 +405,20 @@ namespace Nyks.HotReload.Editor.Core
                 _dynamicAddedMethods.Clear();
                 _dynamicScheduledInvokes.Clear();
             }
-            NativeMethodDetour.ClearOnDomainUnload();
+            NativeMethodDetour.RevertAll();
             HotReloadStateStore.ClearAll();
 
             EditorApplication.delayCall += () =>
             {
                 AssetDatabase.Refresh(ImportAssetOptions.Default);
 
-                // Wait one additional Editor tick so AssetDatabase.Refresh can start asynchronous Bee compilation first.
-                // Calling RequestScriptReload on the same frame as AssetDatabase.Refresh forces a redundant
-                // synchronous StopAssetImportingV2(ForceSynchronousImport | ForceDomainReload) stall.
-                EditorApplication.delayCall += () =>
+                // AssetDatabase.Refresh synchronously sets EditorApplication.isCompiling = true if any .cs file changed on disk.
+                // Only call RequestScriptReload when no script compilation was queued; otherwise RequestScriptReload
+                // forces a redundant second StopAssetImportingV2(ForceSynchronousImport | ForceDomainReload) pass!
+                if (!EditorApplication.isCompiling && !EditorApplication.isUpdating)
                 {
-                    if (!EditorApplication.isCompiling && !EditorApplication.isUpdating)
-                    {
-                        EditorUtility.RequestScriptReload();
-                    }
-                };
+                    EditorUtility.RequestScriptReload();
+                }
             };
         }
 
@@ -474,14 +503,20 @@ namespace Nyks.HotReload.Editor.Core
                         if (currentTicks > previousTicks)
                         {
                             _scriptLastWriteTicks[filePath] = currentTicks;
-                            QueueScriptChange(filePath);
+                            if (EditorApplication.isPlaying || AllowEditModePatching)
+                            {
+                                QueueScriptChange(filePath);
+                            }
                         }
                     }
                     else
                     {
                         // Newly created script file: record baseline and let Unity register new MonoScript if in Edit Mode
                         _scriptLastWriteTicks[filePath] = currentTicks;
-                        QueueScriptChange(filePath);
+                        if (EditorApplication.isPlaying || AllowEditModePatching)
+                        {
+                            QueueScriptChange(filePath);
+                        }
                     }
                 }
             }
@@ -494,6 +529,11 @@ namespace Nyks.HotReload.Editor.Core
         private static void QueueScriptChange(string fullPath)
         {
             if (string.IsNullOrEmpty(fullPath))
+            {
+                return;
+            }
+
+            if (!EditorApplication.isPlaying && !AllowEditModePatching)
             {
                 return;
             }
@@ -579,23 +619,19 @@ namespace Nyks.HotReload.Editor.Core
         {
             switch (state)
             {
+                case PlayModeStateChange.ExitingEditMode:
+                    // Clear any leftover Edit Mode queue so entering Play Mode never triggers a false Play-Mode patch
+                    _pendingFiles.Clear();
+                    break;
+
                 case PlayModeStateChange.EnteredPlayMode:
+                    _pendingFiles.Clear();
+                    StartFileWatcher();
                     UpdateAutoRefreshLockState();
-                    // If scripts were hot-patched in Edit Mode and a Domain Reload happened on Play Mode entry,
-                    // or if we want to ensure all Edit-Mode hot patches are active in Play Mode:
-                    if (NativeMethodDetour.ActiveDetourCount == 0 && _dirtyScriptsSinceDomainReload.Count > 0)
-                    {
-                        foreach (string scriptPath in new List<string>(_dirtyScriptsSinceDomainReload))
-                        {
-                            if (File.Exists(scriptPath))
-                            {
-                                PatchScriptNow(scriptPath);
-                            }
-                        }
-                    }
                     break;
 
                 case PlayModeStateChange.EnteredEditMode:
+                    _pendingFiles.Clear();
                     UpdateAutoRefreshLockState();
                     // If Edit-Mode patching is disabled, sync with Unity when exiting Play Mode.
                     // If Edit-Mode patching is enabled, keep patches active and Editor unfrozen!
@@ -644,14 +680,17 @@ namespace Nyks.HotReload.Editor.Core
                 return;
             }
 
+            // Lock kAutoRefresh ONLY when actively in Play Mode (or if user explicitly enabled Edit-Mode Patching).
+            // Never lock during ExitingEditMode before Play Mode starts, so Unity can always compile Edit-Mode script changes first!
             bool shouldDisableAutoRefreshPref = IsEnabled && LockPlayModeAutoRefresh &&
-                                                (EditorApplication.isPlayingOrWillChangePlaymode || AllowEditModePatching);
+                                                (EditorApplication.isPlaying || AllowEditModePatching);
 
             if (shouldDisableAutoRefreshPref)
             {
                 if (!EditorPrefs.HasKey(PREF_SAVED_UNITY_AUTOREFRESH))
                 {
-                    EditorPrefs.SetInt(PREF_SAVED_UNITY_AUTOREFRESH, EditorPrefs.GetInt(UNITY_PREF_AUTOREFRESH_MODE, 1));
+                    int currentMode = EditorPrefs.GetInt(UNITY_PREF_AUTOREFRESH_MODE, 1);
+                    EditorPrefs.SetInt(PREF_SAVED_UNITY_AUTOREFRESH, currentMode > 0 ? currentMode : 1);
                 }
                 // Set both kAutoRefresh (bool/int) and kAutoRefreshMode (0 = Disabled) so neither Unity nor IDE packages
                 // (e.g. com.unity.ide.visualstudio / com.unity.ide.rider) trigger an unwanted AssetDatabase.Refresh() on Ctrl+S
@@ -698,18 +737,37 @@ namespace Nyks.HotReload.Editor.Core
             if (EditorPrefs.HasKey(PREF_SAVED_UNITY_AUTOREFRESH))
             {
                 int saved = EditorPrefs.GetInt(PREF_SAVED_UNITY_AUTOREFRESH, 1);
-                EditorPrefs.SetBool(UNITY_PREF_AUTOREFRESH, saved != 0);
+                if (saved <= 0)
+                {
+                    saved = 1;
+                }
+                EditorPrefs.SetBool(UNITY_PREF_AUTOREFRESH, true);
                 EditorPrefs.SetInt(UNITY_PREF_AUTOREFRESH, saved);
                 EditorPrefs.SetInt(UNITY_PREF_AUTOREFRESH_MODE, saved);
                 EditorPrefs.DeleteKey(PREF_SAVED_UNITY_AUTOREFRESH);
             }
+            else if (!EditorApplication.isPlaying && !AllowEditModePatching)
+            {
+                // Ensure Unity Auto-Refresh is never left disabled in Edit Mode
+                if (EditorPrefs.GetInt(UNITY_PREF_AUTOREFRESH_MODE, 1) == 0)
+                {
+                    EditorPrefs.SetBool(UNITY_PREF_AUTOREFRESH, true);
+                    EditorPrefs.SetInt(UNITY_PREF_AUTOREFRESH, 1);
+                    EditorPrefs.SetInt(UNITY_PREF_AUTOREFRESH_MODE, 1);
+                }
+            }
         }
+
         private static int ApplyAssemblyDetours(
             Assembly patchAssembly,
             string scriptName,
             List<string> patchedMethodNamesOut,
-            List<CompilerDiagnosticEntry> diagnosticsOut)
+            List<CompilerDiagnosticEntry> diagnosticsOut,
+            out bool requiresDomainReload,
+            out string reloadReason)
         {
+            requiresDomainReload = false;
+            reloadReason = null;
             int patchedCount = 0;
             Type[] patchTypes;
             try
@@ -743,6 +801,8 @@ namespace Nyks.HotReload.Editor.Core
                 Type originalType = FindOriginalRuntimeType(patchType);
                 if (originalType == null)
                 {
+                    requiresDomainReload = true;
+                    reloadReason = $"New type '{patchType.Name}' added";
                     LogDomainReloadAdvisoryOnce(
                         $"NewType:{patchType.FullName}",
                         $"New class/type (<b>{patchType.Name}</b>) detected in <b>{scriptName}</b>. " +
@@ -754,6 +814,8 @@ namespace Nyks.HotReload.Editor.Core
                 {
                     if (HasEnumChanges(originalType, patchType))
                     {
+                        requiresDomainReload = true;
+                        reloadReason = $"Enum '{patchType.Name}' modified";
                         LogDomainReloadAdvisoryOnce(
                             $"EnumChange:{patchType.FullName}",
                             $"Enum definition (<b>{patchType.Name}</b>) was modified in <b>{scriptName}</b>. " +
@@ -764,6 +826,8 @@ namespace Nyks.HotReload.Editor.Core
 
                 if (patchType.IsInterface)
                 {
+                    requiresDomainReload = true;
+                    reloadReason = $"Interface '{patchType.Name}' modified";
                     LogDomainReloadAdvisoryOnce(
                         $"InterfaceChange:{patchType.FullName}",
                         $"Interface (<b>{patchType.Name}</b>) was modified in <b>{scriptName}</b>. " +
@@ -773,6 +837,8 @@ namespace Nyks.HotReload.Editor.Core
 
                 if (patchType.IsGenericTypeDefinition)
                 {
+                    requiresDomainReload = true;
+                    reloadReason = $"Generic type '{patchType.Name}' modified";
                     LogDomainReloadAdvisoryOnce(
                         $"GenericType:{patchType.FullName}",
                         $"Generic type (<b>{patchType.Name}</b>) was modified in <b>{scriptName}</b>. " +
@@ -780,6 +846,8 @@ namespace Nyks.HotReload.Editor.Core
                 }
                 else if (patchType.IsValueType && !patchType.IsEnum)
                 {
+                    requiresDomainReload = true;
+                    reloadReason = $"Struct '{patchType.Name}' modified";
                     LogDomainReloadAdvisoryOnce(
                         $"StructType:{patchType.FullName}",
                         $"Struct (<b>{patchType.Name}</b>) was modified in <b>{scriptName}</b>. " +
@@ -787,10 +855,12 @@ namespace Nyks.HotReload.Editor.Core
                 }
                 else if (HasInheritanceOrInterfaceChanges(originalType, patchType))
                 {
+                    requiresDomainReload = true;
+                    reloadReason = $"Base class or interface list of '{patchType.Name}' changed";
                     LogDomainReloadAdvisoryOnce(
                         $"InheritanceChange:{patchType.FullName}",
                         $"Inheritance hierarchy or implemented interfaces of <b>{patchType.Name}</b> changed in <b>{scriptName}</b>. " +
-                        "To apply structural inheritance changes, click <b>Tools > Hot Reload Pro > Full Domain Reload</b> once.");
+                        "To apply structural inheritance/interface changes (e.g. TryGetComponent<Interface>), click <b>Tools > Hot Reload Pro > Full Domain Reload</b> once.");
                 }
 
                 SynchronizeStaticFields(originalType, patchType);
@@ -833,6 +903,8 @@ namespace Nyks.HotReload.Editor.Core
 
                             if (_unityNativeMessagesRequiringReload.Contains(patchMethod.Name))
                             {
+                                requiresDomainReload = true;
+                                reloadReason = $"New Unity callback '{originalType.Name}.{patchMethod.Name}()' added";
                                 LogDomainReloadAdvisoryOnce(
                                     $"NewUnityMsg:{originalType.FullName}.{patchMethod.Name}",
                                     $"New Unity lifecycle/physics callback '<b>{originalType.Name}.{patchMethod.Name}()</b>' was added to <b>{scriptName}</b>. " +
@@ -840,13 +912,27 @@ namespace Nyks.HotReload.Editor.Core
                                 continue;
                             }
 
-                            if (patchMethod.ReturnType == typeof(void) &&
+                            if (patchMethod.IsPrivate &&
+                                patchMethod.ReturnType == typeof(void) &&
                                 TryRegisterDynamicAddedMethod(originalType, patchMethod))
                             {
                                 patchedCount++;
                                 patchedMethodNamesOut.Add($"{originalType.Name}.{patchMethod.Name} (Dynamic Method)");
+                                continue;
                             }
                         }
+
+                        // Any new non-private method (e.g. interface implementation `public void Collect()`)
+                        // or method with parameters/return value requires a Domain Reload to exist in runtime metadata
+                        requiresDomainReload = true;
+                        if (string.IsNullOrEmpty(reloadReason))
+                        {
+                            reloadReason = $"New method '{originalType.Name}.{patchMethod.Name}()' added";
+                        }
+                        LogDomainReloadAdvisoryOnce(
+                            $"NewMethod:{originalType.FullName}.{patchMethod.Name}",
+                            $"New method '<b>{originalType.Name}.{patchMethod.Name}()</b>' was added to <b>{scriptName}</b>. " +
+                            "To register new public/interface methods in the runtime type table, click <b>Tools > Hot Reload Pro > Full Domain Reload</b> (or press <b>Ctrl+Alt+R</b>) once.");
                         continue;
                     }
 
@@ -1298,7 +1384,9 @@ namespace Nyks.HotReload.Editor.Core
 
         private static void LogDomainReloadAdvisoryOnce(string advisoryKey, string message)
         {
-            if (string.IsNullOrEmpty(advisoryKey))
+            // In Edit Mode, structural changes automatically trigger ForceFullUnityReload(),
+            // so manual reload advisories are only needed during Play Mode.
+            if (!EditorApplication.isPlaying || string.IsNullOrEmpty(advisoryKey))
             {
                 return;
             }
@@ -1321,9 +1409,18 @@ namespace Nyks.HotReload.Editor.Core
 
             if (evt.Success)
             {
-                Debug.Log(
-                    $"<color=#4ADE80><b>[⚡ Hot Reload Pro • {modeTag}]</b></color> Patched <b>{evt.ScriptName}</b> in <b>{evt.TotalTimeMs:F0}ms</b> " +
-                    $"({evt.PatchedMethods.Count} methods, {evt.AddedFields.Count} new fields) via <i>{evt.CompilerEngine}</i>.");
+                if (evt.RequiresDomainReload)
+                {
+                    Debug.LogWarning(
+                        $"<color=#FBBF24><b>[⚠️ Hot Reload Pro • {modeTag}]</b></color> Partial patch on <b>{evt.ScriptName}</b> ({evt.TotalTimeMs:F0}ms): " +
+                        $"<b>{evt.ReloadReason}</b> requires a Full Domain Reload (<b>Ctrl+Alt+R</b>) or exiting Play Mode to take effect.");
+                }
+                else
+                {
+                    Debug.Log(
+                        $"<color=#4ADE80><b>[⚡ Hot Reload Pro • {modeTag}]</b></color> Patched <b>{evt.ScriptName}</b> in <b>{evt.TotalTimeMs:F0}ms</b> " +
+                        $"({evt.PatchedMethods.Count} methods, {evt.AddedFields.Count} new fields) via <i>{evt.CompilerEngine}</i>.");
+                }
             }
             else
             {
