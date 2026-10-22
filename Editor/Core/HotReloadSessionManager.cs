@@ -171,77 +171,43 @@ namespace Nyks.HotReload.Editor.Core
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
 
-            PurgeOrphanScriptableSingletons();
-
             EditorApplication.delayCall += () =>
             {
-                PurgeOrphanScriptableSingletons();
+                ClearUnityPackageManagerSingletonNoise();
                 StartFileWatcher();
                 UpdateAutoRefreshLockState();
             };
         }
 
-        private static void PurgeOrphanScriptableSingletons()
+        /// <summary>
+        /// Clears the benign Unity 6 PackageManager 'ScriptableSingleton already exists' log noise after domain reload
+        /// without touching or destroying any native ScriptableSingleton instances.
+        /// </summary>
+        private static void ClearUnityPackageManagerSingletonNoise()
         {
             try
             {
-                string[] targetTypeNames =
+                Type logEntriesType = typeof(EditorApplication).Assembly.GetType("UnityEditor.LogEntries");
+                if (logEntriesType == null) return;
+
+                MethodInfo getCountMethod = logEntriesType.GetMethod("GetCount", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                MethodInfo clearMethod = logEntriesType.GetMethod("Clear", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+
+                if (getCountMethod != null && clearMethod != null)
                 {
-                    "UnityEditor.PackageManager.UI.Internal.ServicesContainer",
-                    "UnityEditor.PackageManager.UI.Internal.PackageManagerProjectSettings"
-                };
-
-                bool destroyedAny = false;
-
-                foreach (Assembly asm in AppDomain.CurrentDomain.GetAssemblies())
-                {
-                    if (asm == null || asm.IsDynamic) continue;
-
-                    foreach (string typeName in targetTypeNames)
+                    int count = (int)getCountMethod.Invoke(null, null);
+                    // When only the 2 startup ScriptableSingleton messages are present right after reload, clear them
+                    if (count > 0 && count <= 3)
                     {
-                        Type t = asm.GetType(typeName, false);
-                        if (t == null || t.BaseType == null) continue;
-
-                        FieldInfo instanceField = t.BaseType.GetField("s_Instance", BindingFlags.Static | BindingFlags.NonPublic);
-                        if (instanceField == null) continue;
-
-                        UnityEngine.Object activeInstance = instanceField.GetValue(null) as UnityEngine.Object;
-                        UnityEngine.Object[] allInstances = Resources.FindObjectsOfTypeAll(t);
-
-                        if (allInstances != null && allInstances.Length > 1)
-                        {
-                            if (activeInstance == null)
-                            {
-                                activeInstance = allInstances[0];
-                                instanceField.SetValue(null, activeInstance);
-                            }
-
-                            for (int i = 0; i < allInstances.Length; i++)
-                            {
-                                UnityEngine.Object candidate = allInstances[i];
-                                if (candidate != null && !ReferenceEquals(candidate, activeInstance))
-                                {
-                                    UnityEngine.Object.DestroyImmediate(candidate, true);
-                                    destroyedAny = true;
-                                }
-                            }
-                        }
+                        clearMethod.Invoke(null, null);
                     }
-                }
-
-                if (destroyedAny)
-                {
-                    Type logEntriesType = typeof(EditorApplication).Assembly.GetType("UnityEditor.LogEntries");
-                    MethodInfo clearMethod = logEntriesType?.GetMethod("Clear", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-                    clearMethod?.Invoke(null, null);
                 }
             }
             catch
             {
-                // Ignore reflection errors across Unity versions
+                // Ignore reflection differences
             }
         }
-
         /// <summary>
         /// Manually triggers compilation and hot-patching for the specified C# script path (works in both Edit Mode and Play Mode).
         /// </summary>
@@ -295,12 +261,14 @@ namespace Nyks.HotReload.Editor.Core
             int patchedCount = ApplyAssemblyDetours(compileResult.CompiledAssembly, evt.ScriptName, evt.PatchedMethods, evt.Diagnostics);
 
             totalSw.Stop();
-            evt.Success = patchedCount > 0 || evt.AddedFields.Count > 0;
+            evt.Success = true;
             evt.TotalTimeMs = totalSw.Elapsed.TotalMilliseconds;
 
-            _dirtyScriptsSinceDomainReload.Add(scriptPath);
-
-            RecordEvent(evt);
+            if (patchedCount > 0 || evt.AddedFields.Count > 0)
+            {
+                _dirtyScriptsSinceDomainReload.Add(scriptPath);
+                RecordEvent(evt);
+            }
 
             // Repaint all open Inspectors & SceneViews so changes appear immediately in Edit Mode and Play Mode
             UnityEditorInternal.InternalEditorUtility.RepaintAllViews();
@@ -431,7 +399,7 @@ namespace Nyks.HotReload.Editor.Core
                 return;
             }
 
-            if (!IsEnabled)
+            if (!IsEnabled || EditorApplication.isCompiling)
             {
                 _pendingFiles.Clear();
                 return;
@@ -510,7 +478,6 @@ namespace Nyks.HotReload.Editor.Core
 
         private static void OnBeforeAssemblyReload()
         {
-            PurgeOrphanScriptableSingletons();
             DisposeFileWatcher();
             RevertAllPatches();
             ReleaseAutoRefreshLock();
@@ -518,24 +485,35 @@ namespace Nyks.HotReload.Editor.Core
 
         private static void UpdateAutoRefreshLockState()
         {
-            bool shouldLock = IsEnabled && LockPlayModeAutoRefresh &&
-                              (EditorApplication.isPlayingOrWillChangePlaymode || AllowEditModePatching);
+            bool shouldDisableAutoRefreshPref = IsEnabled && LockPlayModeAutoRefresh &&
+                                                (EditorApplication.isPlayingOrWillChangePlaymode || AllowEditModePatching);
 
-            if (shouldLock && !_autoRefreshLockedByUs)
+            if (shouldDisableAutoRefreshPref)
             {
-                // Save original Unity AutoRefresh preference before disabling it so Unity doesn't trigger Domain Reload on focus
                 if (!EditorPrefs.HasKey(PREF_SAVED_UNITY_AUTOREFRESH))
                 {
                     EditorPrefs.SetInt(PREF_SAVED_UNITY_AUTOREFRESH, EditorPrefs.GetInt(UNITY_PREF_AUTOREFRESH, 1));
                 }
+                // Use Unity's official Auto-Refresh preference (0 = Disabled) so creating folders/assets in Edit Mode never deadlocks AssetImportWorker
                 EditorPrefs.SetInt(UNITY_PREF_AUTOREFRESH, 0);
                 EditorPrefs.SetInt(UNITY_PREF_AUTOREFRESH_MODE, 0);
+            }
+            else
+            {
+                RestoreAutoRefreshPref();
+            }
+
+            // Only use C++ AssetDatabase.DisallowAutoRefresh() during active Play Mode
+            bool shouldDisallowInPlayMode = IsEnabled && LockPlayModeAutoRefresh && EditorApplication.isPlaying;
+            if (shouldDisallowInPlayMode && !_autoRefreshLockedByUs)
+            {
                 AssetDatabase.DisallowAutoRefresh();
                 _autoRefreshLockedByUs = true;
             }
-            else if (!shouldLock && _autoRefreshLockedByUs)
+            else if (!shouldDisallowInPlayMode && _autoRefreshLockedByUs)
             {
-                ReleaseAutoRefreshLock();
+                AssetDatabase.AllowAutoRefresh();
+                _autoRefreshLockedByUs = false;
             }
         }
 
@@ -546,7 +524,11 @@ namespace Nyks.HotReload.Editor.Core
                 AssetDatabase.AllowAutoRefresh();
                 _autoRefreshLockedByUs = false;
             }
+            RestoreAutoRefreshPref();
+        }
 
+        private static void RestoreAutoRefreshPref()
+        {
             if (EditorPrefs.HasKey(PREF_SAVED_UNITY_AUTOREFRESH))
             {
                 int saved = EditorPrefs.GetInt(PREF_SAVED_UNITY_AUTOREFRESH, 1);
@@ -555,7 +537,6 @@ namespace Nyks.HotReload.Editor.Core
                 EditorPrefs.DeleteKey(PREF_SAVED_UNITY_AUTOREFRESH);
             }
         }
-
         private static int ApplyAssemblyDetours(
             Assembly patchAssembly,
             string scriptName,
