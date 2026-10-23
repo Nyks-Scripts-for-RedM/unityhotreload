@@ -256,8 +256,10 @@ namespace Nyks.HotReload.Editor.Core
             HotReloadStateStore.OnCancelDynamicInvoke = CancelDynamicInvoke;
             HotReloadStateStore.OnCheckDynamicIsInvoking = CheckDynamicIsInvoking;
 
-            // Immediately lock kAutoRefresh preferences during InitializeOnLoad so IDE integrations
-            // (e.g. VisualStudioIntegration / Rider) never trigger a parallel AssetDatabase.Refresh() after Domain Reload
+            // Immediately initialize file baseline and lock kAutoRefresh preferences during InitializeOnLoad
+            // so scripts edited in an external IDE while Unity is unfocused in the background are never missed
+            // when delayCall finally fires upon window focus.
+            StartFileWatcher();
             UpdateAutoRefreshLockState();
 
             EditorApplication.delayCall += () =>
@@ -266,7 +268,10 @@ namespace Nyks.HotReload.Editor.Core
                 {
                     return;
                 }
-                StartFileWatcher();
+                if (!_initialBaselineComplete)
+                {
+                    StartFileWatcher();
+                }
                 UpdateAutoRefreshLockState();
             };
         }
@@ -1433,7 +1438,14 @@ namespace Nyks.HotReload.Editor.Core
                         errSb.AppendLine($"  • {d}");
                     }
                 }
-                Debug.LogWarning(errSb.ToString());
+                if (EditorApplication.isPlaying)
+                {
+                    Debug.LogWarning(errSb.ToString());
+                }
+                else
+                {
+                    Debug.LogError(errSb.ToString());
+                }
             }
 
             OnPatchApplied?.Invoke(evt);
