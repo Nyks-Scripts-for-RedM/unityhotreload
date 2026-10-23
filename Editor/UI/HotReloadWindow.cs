@@ -42,6 +42,19 @@ namespace Nyks.HotReload.Editor.UI
             HotReloadSessionManager.ForceFullUnityReload();
         }
 
+        [MenuItem("Tools/🧩 Hot Reload Pro — Regenerate IDE .csproj Files", false, 102)]
+        public static void ShortcutRegenerateCsprojFiles()
+        {
+            if (HotReloadSessionManager.EnsureIdeProjectFilesSynced(force: true))
+            {
+                Debug.Log("<color=#4ADE80><b>[⚡ Hot Reload Pro]</b></color> Successfully generated <b>.sln</b> and <b>.csproj</b> files for your IDE!");
+            }
+            else
+            {
+                EditorUtility.RequestScriptReload();
+            }
+        }
+
         private void OnEnable()
         {
             HotReloadSessionManager.OnPatchApplied += OnPatchEvent;

@@ -273,6 +273,7 @@ namespace Nyks.HotReload.Editor.Core
                     StartFileWatcher();
                 }
                 UpdateAutoRefreshLockState();
+                EnsureIdeProjectFilesSynced(force: false);
             };
         }
         /// <summary>
@@ -416,6 +417,7 @@ namespace Nyks.HotReload.Editor.Core
             EditorApplication.delayCall += () =>
             {
                 AssetDatabase.Refresh(ImportAssetOptions.Default);
+                EnsureIdeProjectFilesSynced(force: true);
 
                 // AssetDatabase.Refresh synchronously sets EditorApplication.isCompiling = true if any .cs file changed on disk.
                 // Only call RequestScriptReload when no script compilation was queued; otherwise RequestScriptReload
@@ -425,6 +427,58 @@ namespace Nyks.HotReload.Editor.Core
                     EditorUtility.RequestScriptReload();
                 }
             };
+        }
+
+        /// <summary>
+        /// Generates .sln and .csproj files (via com.unity.ide.visualstudio's SdkStyleProjectGeneration)
+        /// even when Unity classifies custom IDEs (such as Antigravity IDE, Cursor, or Windsurf) as "(internal)"
+        /// and hides the "Regenerate project files" button in Preferences -> External Tools.
+        /// </summary>
+        public static bool EnsureIdeProjectFilesSynced(bool force = false)
+        {
+            try
+            {
+                string assetsPath = Application.dataPath;
+                if (string.IsNullOrEmpty(assetsPath))
+                {
+                    return false;
+                }
+
+                DirectoryInfo parentDir = Directory.GetParent(assetsPath);
+                if (parentDir == null)
+                {
+                    return false;
+                }
+
+                string projectRoot = parentDir.FullName;
+                string csprojPath = Path.Combine(projectRoot, "Assembly-CSharp.csproj");
+                if (!force && File.Exists(csprojPath))
+                {
+                    return false;
+                }
+
+                foreach (Assembly asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    Type sdkGenType = asm.GetType("Microsoft.Unity.VisualStudio.Editor.SdkStyleProjectGeneration", false);
+                    if (sdkGenType == null)
+                    {
+                        continue;
+                    }
+
+                    object generator = Activator.CreateInstance(sdkGenType);
+                    MethodInfo syncMethod = sdkGenType.GetMethod("Sync", BindingFlags.Public | BindingFlags.Instance);
+                    if (syncMethod != null)
+                    {
+                        syncMethod.Invoke(generator, null);
+                        return true;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[HotReloadPro] Failed to sync IDE project files: {ex.Message}");
+            }
+            return false;
         }
 
         private static void StartFileWatcher()
