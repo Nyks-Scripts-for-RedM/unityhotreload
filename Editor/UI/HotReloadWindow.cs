@@ -20,34 +20,47 @@ namespace Nyks.HotReload.Editor.UI
         private Vector2 _scrollPosition;
         private readonly HashSet<int> _expandedEvents = new HashSet<int>();
 
-        private static readonly string[] _tabLabels =
+        private static readonly string[] _tabLabelsEn =
         {
             "📜 Live Patch Feed",
             "🔧 Active Native Detours",
             "🧬 Dynamic Fields (Selected)"
         };
 
+        private static readonly string[] _tabLabelsTr =
+        {
+            "📜 Canlı Yama Geçmişi",
+            "🔧 Aktif Metot Yamaları",
+            "🧬 Dinamik Değişkenler (Seçili)"
+        };
+
         [MenuItem("Tools/⚡ Hot Reload Pro %#h", false, 100)]
         public static void ShowWindow()
         {
             var window = GetWindow<HotReloadWindow>("⚡ Hot Reload Pro");
-            window.minSize = new Vector2(460f, 400f);
+            window.minSize = new Vector2(460f, 420f);
             window.Show();
         }
 
         [MenuItem("Tools/🔄 Hot Reload Pro — Full Domain Reload %&r", false, 101)]
         public static void ShortcutFullDomainReload()
         {
-            Debug.Log("<color=#38BDF8><b>[⚡ Hot Reload Pro]</b></color> Triggering Full Domain Reload (<b>Ctrl+Alt+R</b>)...");
+            bool tr = HotReloadSessionManager.IsTurkish;
+            Debug.Log(tr
+                ? "<color=#38BDF8><b>[⚡ Hot Reload Pro]</b></color> Tam Derleme / Domain Reload başlatılıyor (<b>Ctrl+Alt+R</b>)..."
+                : "<color=#38BDF8><b>[⚡ Hot Reload Pro]</b></color> Triggering Full Domain Reload (<b>Ctrl+Alt+R</b>)...");
             HotReloadSessionManager.ForceFullUnityReload();
         }
 
         [MenuItem("Tools/🧩 Hot Reload Pro — Regenerate IDE .csproj Files", false, 102)]
         public static void ShortcutRegenerateCsprojFiles()
         {
+            bool tr = HotReloadSessionManager.IsTurkish;
             if (HotReloadSessionManager.EnsureIdeProjectFilesSynced(force: true))
             {
-                Debug.Log("<color=#4ADE80><b>[⚡ Hot Reload Pro]</b></color> Successfully generated <b>.sln</b> and <b>.csproj</b> files for your IDE!");
+                Debug.Log(tr
+                    ? "<color=#4ADE80><b>[⚡ Hot Reload Pro]</b></color> IDE için <b>.sln</b> ve <b>.csproj</b> proje dosyaları başarıyla oluşturuldu!"
+                    : "<color=#4ADE80><b>[⚡ Hot Reload Pro]</b></color> Successfully generated <b>.sln</b> and <b>.csproj</b> files for your IDE!");
             }
             else
             {
@@ -76,35 +89,38 @@ namespace Nyks.HotReload.Editor.UI
 
         private void OnGUI()
         {
-            DrawHeaderBanner();
+            bool tr = HotReloadSessionManager.IsTurkish;
+
+            DrawHeaderBanner(tr);
             EditorGUILayout.Space(4f);
-            DrawConfigurationPanel();
+            DrawConfigurationPanel(tr);
             EditorGUILayout.Space(4f);
-            DrawActionToolbar();
+            DrawActionToolbar(tr);
             EditorGUILayout.Space(6f);
 
-            _selectedTab = GUILayout.Toolbar(_selectedTab, _tabLabels, GUILayout.Height(24f));
+            string[] tabs = tr ? _tabLabelsTr : _tabLabelsEn;
+            _selectedTab = GUILayout.Toolbar(_selectedTab, tabs, GUILayout.Height(24f));
             EditorGUILayout.Space(4f);
 
             _scrollPosition = EditorGUILayout.BeginScrollView(_scrollPosition);
             switch (_selectedTab)
             {
                 case 0:
-                    DrawLivePatchFeedTab();
+                    DrawLivePatchFeedTab(tr);
                     break;
                 case 1:
-                    DrawActiveDetoursTab();
+                    DrawActiveDetoursTab(tr);
                     break;
                 case 2:
-                    DrawDynamicFieldsTab();
+                    DrawDynamicFieldsTab(tr);
                     break;
             }
             EditorGUILayout.EndScrollView();
 
-            DrawFooter();
+            DrawFooter(tr);
         }
 
-        private void DrawHeaderBanner()
+        private void DrawHeaderBanner(bool tr)
         {
             Rect bannerRect = EditorGUILayout.GetControlRect(false, 48f);
             bool active = HotReloadSessionManager.IsEnabled;
@@ -134,57 +150,68 @@ namespace Nyks.HotReload.Editor.UI
             };
 
             string statusText = active
-                ? "⚡ NYKS HOT RELOAD PRO — ACTIVE"
-                : "⏸ NYKS HOT RELOAD PRO — PAUSED";
+                ? (tr ? "⚡ NYKS HOT RELOAD PRO — AKTİF" : "⚡ NYKS HOT RELOAD PRO — ACTIVE")
+                : (tr ? "⏸ NYKS HOT RELOAD PRO — DURAKLATILDI" : "⏸ NYKS HOT RELOAD PRO — PAUSED");
 
             string modeInfo = EditorApplication.isPlaying
-                ? "Play Mode Active ⚡ (Domain Reload Locked 🔒)"
+                ? (tr ? "Play Mode Aktif ⚡ (Domain Reload Kilitli 🔒)" : "Play Mode Active ⚡ (Domain Reload Locked 🔒)")
                 : (HotReloadSessionManager.AllowEditModePatching
-                    ? "Edit Mode + Play Mode Active ⚡ (Domain Reload Locked 🔒)"
-                    : "Play Mode Only (Waiting for Play Mode)");
+                    ? (tr ? "Edit Mode + Play Mode Aktif ⚡ (Donma Kilitli 🔒)" : "Edit Mode + Play Mode Active ⚡ (Domain Reload Locked 🔒)")
+                    : (tr ? "Sadece Play Mode (Play Mode Bekleniyor)" : "Play Mode Only (Waiting for Play Mode)"));
 
-            string subText = $"{modeInfo}  •  Active Detours: {NativeMethodDetour.ActiveDetourCount}  •  Unity {Application.unityVersion}";
+            string subText = tr
+                ? $"{modeInfo}  •  Aktif Yama: {NativeMethodDetour.ActiveDetourCount}  •  Unity {Application.unityVersion}"
+                : $"{modeInfo}  •  Active Detours: {NativeMethodDetour.ActiveDetourCount}  •  Unity {Application.unityVersion}";
 
             GUI.Label(new Rect(bannerRect.x + 14f, bannerRect.y + 6f, bannerRect.width - 20f, 20f), statusText, titleStyle);
             GUI.Label(new Rect(bannerRect.x + 14f, bannerRect.y + 26f, bannerRect.width - 20f, 18f), subText, subStyle);
         }
 
-        private void DrawConfigurationPanel()
+        private void DrawConfigurationPanel(bool tr)
         {
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);
 
             EditorGUILayout.BeginHorizontal();
             HotReloadSessionManager.IsEnabled = EditorGUILayout.ToggleLeft(
-                new GUIContent("Enable Hot Reload Watcher", "Automatically compiles and patches modified .cs files."),
+                new GUIContent(
+                    tr ? "Hot Reload İzleyiciyi Etkinleştir" : "Enable Hot Reload Watcher",
+                    tr ? "Değişen .cs dosyalarını otomatik derler ve anında yamalar." : "Automatically compiles and patches modified .cs files."),
                 HotReloadSessionManager.IsEnabled);
 
             HotReloadSessionManager.LockPlayModeAutoRefresh = EditorGUILayout.ToggleLeft(
-                new GUIContent("Lock Unity Domain Reload", "Prevents Unity from freezing and performing a full Domain Reload."),
+                new GUIContent(
+                    tr ? "Unity Donmasını / Domain Reload'u Kilitle" : "Lock Unity Domain Reload",
+                    tr ? "Unity'nin her kayıtta donmasını ve baştan derleme yapmasını engeller." : "Prevents Unity from freezing and performing a full Domain Reload."),
                 HotReloadSessionManager.LockPlayModeAutoRefresh);
             EditorGUILayout.EndHorizontal();
 
             EditorGUILayout.BeginHorizontal();
             HotReloadSessionManager.AllowEditModePatching = EditorGUILayout.ToggleLeft(
-                new GUIContent("Allow Edit-Mode Hot Patching", "Also hot-patches methods when saving scripts outside Play Mode."),
+                new GUIContent(
+                    tr ? "Edit Mode (Oyun Dışı) Anında Yama" : "Allow Edit-Mode Hot Patching",
+                    tr ? "Oyun çalışmıyorken de (Edit Mode) kodları donmadan anında yamalar." : "Also hot-patches methods when saving scripts outside Play Mode."),
                 HotReloadSessionManager.AllowEditModePatching);
 
             HotReloadSessionManager.ShowToastNotifications = EditorGUILayout.ToggleLeft(
-                new GUIContent("Show SceneView / GameView Toast", "Displays a floating notification badge whenever a script is hot-reloaded."),
+                new GUIContent(
+                    tr ? "Sahne / Oyun Ekranı Bildirimi Göster" : "Show SceneView / GameView Toast",
+                    tr ? "Kod güncellendiğinde sağ altta bildirim kutusu gösterir." : "Displays a floating notification badge whenever a script is hot-reloaded."),
                 HotReloadSessionManager.ShowToastNotifications);
             EditorGUILayout.EndHorizontal();
 
             EditorGUILayout.Space(2f);
             EditorGUILayout.BeginHorizontal();
             EditorGUILayout.LabelField(
-                new GUIContent("🎯 Patch Trigger Mode:", "Choose whether to compile & patch immediately on Ctrl+S or wait until you click back into the Unity Editor window."),
+                new GUIContent(
+                    tr ? "🎯 Tetikleme Modu:" : "🎯 Patch Trigger Mode:",
+                    tr ? "Ctrl+S yapıldığı anda mı yoksa Unity ekranına tıkladığında mı yama yapılacağını seçin." : "Choose whether to compile & patch immediately on Ctrl+S or wait until you click back into the Unity Editor window."),
                 EditorStyles.boldLabel,
                 GUILayout.Width(145f));
 
-            string[] triggerOptions =
-            {
-                "⚡ Instant on Save (Ctrl+S)",
-                "🖱️ On Unity Focus (When Clicked)"
-            };
+            string[] triggerOptions = tr
+                ? new[] { "⚡ Kaydedince Anında (Ctrl+S)", "🖱️ Unity'ye Tıklayınca (Odaklanınca)" }
+                : new[] { "⚡ Instant on Save (Ctrl+S)", "🖱️ On Unity Focus (When Clicked)" };
+
             int currentTrigger = (int)HotReloadSessionManager.TriggerMode;
             int newTrigger = GUILayout.Toolbar(currentTrigger, triggerOptions, GUILayout.Height(21f));
             if (newTrigger != currentTrigger)
@@ -193,23 +220,44 @@ namespace Nyks.HotReload.Editor.UI
             }
             EditorGUILayout.EndHorizontal();
 
+            EditorGUILayout.Space(2f);
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField(
+                new GUIContent(
+                    tr ? "🌐 Dil / Language:" : "🌐 Language / Dil:",
+                    tr ? "Arayüz ve Console hata açıklamalarının dilini seçin (Otomatik hatırlanır)." : "Select UI and Console error explanation language (Saved automatically)."),
+                EditorStyles.boldLabel,
+                GUILayout.Width(145f));
+
+            string[] langOptions = { "🇹🇷 Türkçe", "🇬🇧 English" };
+            int currentLang = (int)HotReloadSessionManager.Language;
+            int newLang = GUILayout.Toolbar(currentLang, langOptions, GUILayout.Height(21f));
+            if (newLang != currentLang)
+            {
+                HotReloadSessionManager.Language = (HotReloadLanguage)newLang;
+            }
+            EditorGUILayout.EndHorizontal();
+
             EditorGUILayout.EndVertical();
         }
 
-        private void DrawActionToolbar()
+        private void DrawActionToolbar(bool tr)
         {
             EditorGUILayout.BeginHorizontal();
 
             GUI.enabled = !string.IsNullOrEmpty(HotReloadSessionManager.LastModifiedScriptPath);
-            if (GUILayout.Button("⚡ Re-Patch Last Script", GUILayout.Height(24f)))
+            if (GUILayout.Button(tr ? "⚡ Son Scripti Yamala" : "⚡ Re-Patch Last Script", GUILayout.Height(24f)))
             {
                 HotReloadSessionManager.PatchScriptNow(HotReloadSessionManager.LastModifiedScriptPath);
             }
             GUI.enabled = true;
 
-            if (GUILayout.Button("📂 Patch .cs File...", GUILayout.Height(24f)))
+            if (GUILayout.Button(tr ? "📂 .cs Seç ve Yamala..." : "📂 Patch .cs File...", GUILayout.Height(24f)))
             {
-                string chosen = EditorUtility.OpenFilePanel("Select C# Script to Hot-Patch", Application.dataPath, "cs");
+                string chosen = EditorUtility.OpenFilePanel(
+                    tr ? "Yamalanacak C# Scriptini Seçin" : "Select C# Script to Hot-Patch",
+                    Application.dataPath,
+                    "cs");
                 if (!string.IsNullOrEmpty(chosen))
                 {
                     HotReloadSessionManager.PatchScriptNow(chosen);
@@ -217,14 +265,18 @@ namespace Nyks.HotReload.Editor.UI
             }
 
             GUI.enabled = NativeMethodDetour.ActiveDetourCount > 0;
-            if (GUILayout.Button("↩ Revert Patches", GUILayout.Height(24f)))
+            if (GUILayout.Button(tr ? "↩ Yamaları Geri Al" : "↩ Revert Patches", GUILayout.Height(24f)))
             {
                 int count = HotReloadSessionManager.RevertAllPatches();
-                ShowNotification(new GUIContent($"Reverted {count} method detours."));
+                ShowNotification(new GUIContent(tr ? $"{count} metot yaması geri alındı." : $"Reverted {count} method detours."));
             }
             GUI.enabled = true;
 
-            if (GUILayout.Button(new GUIContent("🔄 Full Domain Reload (Ctrl+Alt+R)", "Triggers a full Unity script compilation and Domain Reload (Shortcut: Ctrl+Alt+R)."), GUILayout.Height(24f)))
+            if (GUILayout.Button(
+                new GUIContent(
+                    tr ? "🔄 Tam Derleme (Ctrl+Alt+R)" : "🔄 Full Domain Reload (Ctrl+Alt+R)",
+                    tr ? "Unity'nin tam derlemesini ve Domain Reload işlemini başlatır (Kısayol: Ctrl+Alt+R)." : "Triggers a full Unity script compilation and Domain Reload (Shortcut: Ctrl+Alt+R)."),
+                GUILayout.Height(24f)))
             {
                 HotReloadSessionManager.ForceFullUnityReload();
             }
@@ -232,16 +284,21 @@ namespace Nyks.HotReload.Editor.UI
             EditorGUILayout.EndHorizontal();
         }
 
-        private void DrawLivePatchFeedTab()
+        private void DrawLivePatchFeedTab(bool tr)
         {
             IReadOnlyList<HotReloadPatchEvent> history = HotReloadSessionManager.History;
             if (history.Count == 0)
             {
                 EditorGUILayout.HelpBox(
-                    "Hot Reload Pro is ACTIVE in both Edit Mode and Play Mode!\n\n" +
-                    "1. Open any C# script in your IDE (e.g. PlayerController.cs) right now (in Edit Mode OR Play Mode).\n" +
-                    "2. Modify any method or add a field and press Ctrl+S.\n" +
-                    "3. Watch it compile and patch here in milliseconds without freezing Unity!",
+                    tr
+                        ? "Hot Reload Pro hem Edit Mode hem Play Mode'da AKTİF!\n\n" +
+                          "1. IDE'nde herhangi bir C# scriptini aç (ör. PlayerController.cs).\n" +
+                          "2. Bir metodu değiştir veya yeni değişken ekle ve Ctrl+S yap.\n" +
+                          "3. Unity donmadan milisaniyeler içinde yamalandığını burada gör!"
+                        : "Hot Reload Pro is ACTIVE in both Edit Mode and Play Mode!\n\n" +
+                          "1. Open any C# script in your IDE (e.g. PlayerController.cs) right now (in Edit Mode OR Play Mode).\n" +
+                          "2. Modify any method or add a field and press Ctrl+S.\n" +
+                          "3. Watch it compile and patch here in milliseconds without freezing Unity!",
                     MessageType.Info);
                 return;
             }
@@ -252,8 +309,11 @@ namespace Nyks.HotReload.Editor.UI
                 EditorGUILayout.BeginVertical(EditorStyles.helpBox);
 
                 EditorGUILayout.BeginHorizontal();
-                string icon = !evt.Success ? "❌" : (evt.RequiresDomainReload ? "⚠️" : "✅");
-                string header = $"{icon} [{evt.TimestampLocal:HH:mm:ss}]  {evt.ScriptName}  —  {evt.TotalTimeMs:F0} ms ({evt.CompilerEngine})";
+                string icon = !evt.Success ? "📝" : (evt.RequiresDomainReload ? "⚠️" : "✅");
+                string statusPrefix = !evt.Success
+                    ? (tr ? "[Kod Hatası] " : "[Script Error] ")
+                    : string.Empty;
+                string header = $"{icon} [{evt.TimestampLocal:HH:mm:ss}]  {statusPrefix}{evt.ScriptName}  —  {evt.TotalTimeMs:F0} ms ({evt.CompilerEngine})";
 
                 bool isExpanded = _expandedEvents.Contains(i);
                 bool nextExpanded = EditorGUILayout.Foldout(isExpanded, header, true, EditorStyles.boldLabel);
@@ -264,7 +324,10 @@ namespace Nyks.HotReload.Editor.UI
                 }
 
                 GUILayout.FlexibleSpace();
-                EditorGUILayout.LabelField($"{evt.PatchedMethods.Count} methods", EditorStyles.miniLabel, GUILayout.Width(72f));
+                EditorGUILayout.LabelField(
+                    tr ? $"{evt.PatchedMethods.Count} metot" : $"{evt.PatchedMethods.Count} methods",
+                    EditorStyles.miniLabel,
+                    GUILayout.Width(72f));
                 EditorGUILayout.EndHorizontal();
 
                 if (nextExpanded)
@@ -272,7 +335,7 @@ namespace Nyks.HotReload.Editor.UI
                     EditorGUI.indentLevel++;
                     if (evt.PatchedMethods.Count > 0)
                     {
-                        EditorGUILayout.LabelField("Patched Methods:", EditorStyles.miniBoldLabel);
+                        EditorGUILayout.LabelField(tr ? "Yamalanan Metotlar:" : "Patched Methods:", EditorStyles.miniBoldLabel);
                         foreach (string m in evt.PatchedMethods)
                         {
                             EditorGUILayout.LabelField($"• {m}", EditorStyles.miniLabel);
@@ -281,7 +344,7 @@ namespace Nyks.HotReload.Editor.UI
 
                     if (evt.AddedFields.Count > 0)
                     {
-                        EditorGUILayout.LabelField("Dynamic Virtual Fields Added:", EditorStyles.miniBoldLabel);
+                        EditorGUILayout.LabelField(tr ? "Eklenen Dinamik Değişkenler:" : "Dynamic Virtual Fields Added:", EditorStyles.miniBoldLabel);
                         foreach (string f in evt.AddedFields)
                         {
                             EditorGUILayout.LabelField($"• {f}", EditorStyles.miniLabel);
@@ -290,11 +353,14 @@ namespace Nyks.HotReload.Editor.UI
 
                     if (evt.Diagnostics.Count > 0)
                     {
-                        EditorGUILayout.LabelField("Compiler Diagnostics:", EditorStyles.miniBoldLabel);
+                        EditorGUILayout.LabelField(
+                            tr ? "Kod Hataları (Eklenti hatası değildir, yazdığın C# kodundaki hatalar):" : "Script Compiler Diagnostics:",
+                            EditorStyles.miniBoldLabel);
                         foreach (CompilerDiagnosticEntry d in evt.Diagnostics)
                         {
                             MessageType msgType = d.IsError ? MessageType.Error : MessageType.Warning;
-                            EditorGUILayout.HelpBox(d.ToString(), msgType);
+                            string text = HotReloadSessionManager.FormatDiagnosticForUser(d, tr).Replace("<b>", "").Replace("</b>", "");
+                            EditorGUILayout.HelpBox(text, msgType);
                         }
                     }
                     EditorGUI.indentLevel--;
@@ -304,12 +370,14 @@ namespace Nyks.HotReload.Editor.UI
             }
         }
 
-        private void DrawActiveDetoursTab()
+        private void DrawActiveDetoursTab(bool tr)
         {
             IReadOnlyCollection<DetourRecord> detours = NativeMethodDetour.ActiveDetours;
             if (detours.Count == 0)
             {
-                EditorGUILayout.HelpBox("No native method detours are currently active in memory.", MessageType.Info);
+                EditorGUILayout.HelpBox(
+                    tr ? "Şu anda bellekte aktif bir metot yaması yok." : "No native method detours are currently active in memory.",
+                    MessageType.Info);
                 return;
             }
 
@@ -319,18 +387,24 @@ namespace Nyks.HotReload.Editor.UI
                 string ownerName = record.OriginalMethod.DeclaringType != null ? record.OriginalMethod.DeclaringType.FullName : "<Global>";
                 EditorGUILayout.LabelField($"🔧 {ownerName}.{record.OriginalMethod.Name}", EditorStyles.boldLabel);
                 EditorGUILayout.LabelField(
-                    $"Original Ptr: 0x{record.OriginalSite.ToInt64():X}  →  Patched Ptr: 0x{record.TargetSite.ToInt64():X}   |   Revisions: {record.PatchCount}",
+                    tr
+                        ? $"Orijinal Adres: 0x{record.OriginalSite.ToInt64():X}  →  Yama Adresi: 0x{record.TargetSite.ToInt64():X}   |   Revizyon: {record.PatchCount}"
+                        : $"Original Ptr: 0x{record.OriginalSite.ToInt64():X}  →  Patched Ptr: 0x{record.TargetSite.ToInt64():X}   |   Revisions: {record.PatchCount}",
                     EditorStyles.miniLabel);
                 EditorGUILayout.EndVertical();
             }
         }
 
-        private void DrawDynamicFieldsTab()
+        private void DrawDynamicFieldsTab(bool tr)
         {
             GameObject selectedGo = Selection.activeGameObject;
             if (selectedGo == null)
             {
-                EditorGUILayout.HelpBox("Select a GameObject in the Hierarchy to inspect and edit any fields dynamically added during Play Mode.", MessageType.Info);
+                EditorGUILayout.HelpBox(
+                    tr
+                        ? "Play Mode sırasında yeni eklediğin değişkenleri görmek ve düzenlemek için Hierarchy'den bir GameObject seç."
+                        : "Select a GameObject in the Hierarchy to inspect and edit any fields dynamically added during Play Mode.",
+                    MessageType.Info);
                 return;
             }
 
@@ -356,8 +430,11 @@ namespace Nyks.HotReload.Editor.UI
             if (!anyFound)
             {
                 EditorGUILayout.HelpBox(
-                    $"Selected GameObject '{selectedGo.name}' has no dynamically added fields yet.\n" +
-                    "Try adding a new field (e.g., '[SerializeField] private float _boostBonus = 25f;') to one of its scripts during Play Mode and press Ctrl+S!",
+                    tr
+                        ? $"Seçili '{selectedGo.name}' objesinde henüz dinamik eklenmiş bir değişken yok.\n" +
+                          "Play Mode sırasında bu objenin scriptine yeni bir değişken ekleyip Ctrl+S yapabilirsin!"
+                        : $"Selected GameObject '{selectedGo.name}' has no dynamically added fields yet.\n" +
+                          "Try adding a new field (e.g., '[SerializeField] private float _boostBonus = 25f;') to one of its scripts during Play Mode and press Ctrl+S!",
                     MessageType.Info);
             }
         }
@@ -422,10 +499,14 @@ namespace Nyks.HotReload.Editor.UI
             }
         }
 
-        private void DrawFooter()
+        private void DrawFooter(bool tr)
         {
             EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
-            GUILayout.Label("Nyks Hot Reload Pro v1.0.0  •  Apache-2.0 License  •  Zero Build Footprint", EditorStyles.miniLabel);
+            GUILayout.Label(
+                tr
+                    ? "Nyks Hot Reload Pro v1.0.0  •  Apache-2.0 Lisansı  •  Sıfır Build İzi"
+                    : "Nyks Hot Reload Pro v1.0.0  •  Apache-2.0 License  •  Zero Build Footprint",
+                EditorStyles.miniLabel);
             GUILayout.FlexibleSpace();
             EditorGUILayout.EndHorizontal();
         }

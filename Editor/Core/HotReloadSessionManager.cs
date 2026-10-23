@@ -27,6 +27,15 @@ namespace Nyks.HotReload.Editor.Core
     }
 
     /// <summary>
+    /// Display language for Hot Reload Pro UI, toast notifications, and console messages.
+    /// </summary>
+    public enum HotReloadLanguage
+    {
+        Turkish = 0,
+        English = 1
+    }
+
+    /// <summary>
     /// Represents a single Hot Reload compilation & patch event recorded in the session history.
     /// </summary>
     public sealed class HotReloadPatchEvent
@@ -56,6 +65,7 @@ namespace Nyks.HotReload.Editor.Core
         private const string PREF_ALLOW_EDITMODE = "Nyks.HotReload.AllowEditModePatch_v3";
         private const string PREF_SHOW_TOAST = "Nyks.HotReload.ShowToast";
         private const string PREF_TRIGGER_MODE = "Nyks.HotReload.TriggerMode";
+        private const string PREF_LANGUAGE = "Nyks.HotReload.Language";
         private const string PREF_SAVED_UNITY_AUTOREFRESH = "Nyks.HotReload.SavedUnityAutoRefresh";
 
         private const string UNITY_PREF_AUTOREFRESH = "kAutoRefresh";
@@ -202,6 +212,25 @@ namespace Nyks.HotReload.Editor.Core
                 }
             }
         }
+
+        /// <summary>
+        /// Persistent UI and Console diagnostic language (remembers selection across Unity restarts).
+        /// </summary>
+        public static HotReloadLanguage Language
+        {
+            get => (HotReloadLanguage)EditorPrefs.GetInt(PREF_LANGUAGE, (int)HotReloadLanguage.Turkish);
+            set
+            {
+                int intVal = (int)value;
+                if (EditorPrefs.GetInt(PREF_LANGUAGE, (int)HotReloadLanguage.Turkish) != intVal)
+                {
+                    EditorPrefs.SetInt(PREF_LANGUAGE, intVal);
+                    OnStatusChanged?.Invoke();
+                }
+            }
+        }
+
+        public static bool IsTurkish => Language == HotReloadLanguage.Turkish;
 
         public static IReadOnlyList<HotReloadPatchEvent> History => _history;
         public static string LastModifiedScriptPath => _lastModifiedScriptPath;
@@ -354,9 +383,9 @@ namespace Nyks.HotReload.Editor.Core
             // automatically trigger a clean Unity compilation so the user never has to manually click Full Reload!
             if (!EditorApplication.isPlaying && evt.RequiresDomainReload)
             {
-                Debug.Log(
-                    $"<color=#38BDF8><b>[⚡ Hot Reload Pro • Edit Mode]</b></color> Structural change detected in <b>{evt.ScriptName}</b> ({evt.ReloadReason}). " +
-                    "Automatically syncing with Unity compiler...");
+                Debug.Log(IsTurkish
+                    ? $"<color=#38BDF8><b>[⚡ Hot Reload Pro • Edit Mode]</b></color> <b>{evt.ScriptName}</b> içinde yapısal değişiklik algılandı ({evt.ReloadReason}). Unity derleyicisiyle otomatik eşitleniyor..."
+                    : $"<color=#38BDF8><b>[⚡ Hot Reload Pro • Edit Mode]</b></color> Structural change detected in <b>{evt.ScriptName}</b> ({evt.ReloadReason}). Automatically syncing with Unity compiler...");
                 ForceFullUnityReload();
                 return evt;
             }
@@ -1465,31 +1494,44 @@ namespace Nyks.HotReload.Editor.Core
             }
 
             string modeTag = EditorApplication.isPlaying ? "Play Mode" : "Edit Mode";
+            bool tr = IsTurkish;
 
             if (evt.Success)
             {
                 if (evt.RequiresDomainReload)
                 {
-                    Debug.LogWarning(
-                        $"<color=#FBBF24><b>[⚠️ Hot Reload Pro • {modeTag}]</b></color> Partial patch on <b>{evt.ScriptName}</b> ({evt.TotalTimeMs:F0}ms): " +
-                        $"<b>{evt.ReloadReason}</b> requires a Full Domain Reload (<b>Ctrl+Alt+R</b>) or exiting Play Mode to take effect.");
+                    Debug.LogWarning(tr
+                        ? $"<color=#FBBF24><b>[⚠️ Hot Reload Pro • {modeTag}]</b></color> <b>{evt.ScriptName}</b> kısmen güncellendi ({evt.TotalTimeMs:F0}ms): " +
+                          $"<b>{evt.ReloadReason}</b> için Play Mode'dan çıkmanız veya Tam Yenileme (<b>Ctrl+Alt+R</b>) yapmanız gerekir."
+                        : $"<color=#FBBF24><b>[⚠️ Hot Reload Pro • {modeTag}]</b></color> Partial patch on <b>{evt.ScriptName}</b> ({evt.TotalTimeMs:F0}ms): " +
+                          $"<b>{evt.ReloadReason}</b> requires a Full Domain Reload (<b>Ctrl+Alt+R</b>) or exiting Play Mode to take effect.");
                 }
                 else
                 {
-                    Debug.Log(
-                        $"<color=#4ADE80><b>[⚡ Hot Reload Pro • {modeTag}]</b></color> Patched <b>{evt.ScriptName}</b> in <b>{evt.TotalTimeMs:F0}ms</b> " +
-                        $"({evt.PatchedMethods.Count} methods, {evt.AddedFields.Count} new fields) via <i>{evt.CompilerEngine}</i>.");
+                    Debug.Log(tr
+                        ? $"<color=#4ADE80><b>[⚡ Hot Reload Pro • {modeTag}]</b></color> <b>{evt.ScriptName}</b> <b>{evt.TotalTimeMs:F0}ms</b> içinde güncellendi " +
+                          $"({evt.PatchedMethods.Count} metot, {evt.AddedFields.Count} yeni değişken)."
+                        : $"<color=#4ADE80><b>[⚡ Hot Reload Pro • {modeTag}]</b></color> Patched <b>{evt.ScriptName}</b> in <b>{evt.TotalTimeMs:F0}ms</b> " +
+                          $"({evt.PatchedMethods.Count} methods, {evt.AddedFields.Count} new fields) via <i>{evt.CompilerEngine}</i>.");
                 }
             }
             else
             {
                 var errSb = new System.Text.StringBuilder();
-                errSb.AppendLine($"<color=#F87171><b>[⚡ Hot Reload Pro • {modeTag}]</b></color> Failed to compile <b>{evt.ScriptName}</b>:");
+                if (tr)
+                {
+                    errSb.AppendLine($"<color=#F87171><b>[📝 Kod Hatası • {evt.ScriptName}]</b></color> <i>(Eklenti hatası değildir — yazdığın C# kodunda hata var)</i>:");
+                }
+                else
+                {
+                    errSb.AppendLine($"<color=#F87171><b>[📝 C# Script Error • {evt.ScriptName}]</b></color> <i>(Code error in your C# script, not a plugin error)</i>:");
+                }
+
                 foreach (CompilerDiagnosticEntry d in evt.Diagnostics)
                 {
                     if (d.IsError)
                     {
-                        errSb.AppendLine($"  • {d}");
+                        errSb.AppendLine($"  • {FormatDiagnosticForUser(d, tr)}");
                     }
                 }
                 if (EditorApplication.isPlaying)
@@ -1504,6 +1546,103 @@ namespace Nyks.HotReload.Editor.Core
 
             OnPatchApplied?.Invoke(evt);
             OnStatusChanged?.Invoke();
+        }
+
+        public static string FormatDiagnosticForUser(CompilerDiagnosticEntry d, bool turkish)
+        {
+            if (d == null)
+            {
+                return string.Empty;
+            }
+
+            if (!turkish)
+            {
+                return d.ToString();
+            }
+
+            string loc = d.Line > 0 ? $"(Satır {d.Line}, Sütun {d.Column}) " : string.Empty;
+            string translated = TranslateCompilerErrorToTurkish(d.Id, d.Message);
+            return $"{loc}<b>{d.Id}</b>: {translated}";
+        }
+
+        private static string TranslateCompilerErrorToTurkish(string id, string msg)
+        {
+            if (string.IsNullOrEmpty(msg))
+            {
+                return string.Empty;
+            }
+
+            switch (id)
+            {
+                case "CS0103":
+                {
+                    string sym = ExtractFirstSingleQuoted(msg);
+                    return !string.IsNullOrEmpty(sym)
+                        ? $"'{sym}' adında bir değişken veya metot tanımlı değil (Yukarıda tanımlamayı unutmuş olabilirsin veya yazım hatası var)."
+                        : $"Tanımlanmamış değişken veya metot kullanımı ({msg})";
+                }
+                case "CS0246":
+                {
+                    string sym = ExtractFirstSingleQuoted(msg);
+                    return !string.IsNullOrEmpty(sym)
+                        ? $"'{sym}' tipi/sınıfı bulunamadı (Dosyanın en üstüne ilgili 'using ...;' kütüphanesini eklemeyi unutmuş olabilirsin veya sınıf adı yanlış)."
+                        : $"Tip veya namespace bulunamadı ({msg})";
+                }
+                case "CS1002":
+                    return "Satır sonunda noktalı virgül (;) eksik.";
+                case "CS1513":
+                    return "Süslü parantez kapatma (}) eksik.";
+                case "CS1026":
+                    return "Normal parantez kapatma ()) eksik.";
+                case "CS1061":
+                case "CS0117":
+                {
+                    string sym = ExtractSecondSingleQuoted(msg) ?? ExtractFirstSingleQuoted(msg);
+                    return !string.IsNullOrEmpty(sym)
+                        ? $"Bu sınıfın içinde '{sym}' adında bir metot veya değişken yok (Yazım hatası olabilir)."
+                        : $"Sınıf içinde böyle bir üye/metot bulunamadı ({msg})";
+                }
+                case "CS0029":
+                    return $"Tip uyuşmazlığı — bir veri tipini diğerine doğrudan atayamazsın ({msg})";
+                case "CS0161":
+                    return $"Metot değer döndürmeli ama tüm durumlarda 'return' yazılmamış ({msg})";
+                case "CS0120":
+                {
+                    string sym = ExtractFirstSingleQuoted(msg);
+                    return !string.IsNullOrEmpty(sym)
+                        ? $"'{sym}' statik olmadığı için doğrudan sınıf adıyla çağrılamaz, bir obje referansı gerekli."
+                        : $"Statik olmayan üye için obje referansı gerekli ({msg})";
+                }
+                case "CS7036":
+                case "CS1501":
+                    return $"Metot çağrısında eksik veya fazla parametre var ({msg})";
+                case "CS1503":
+                    return $"Metoda gönderilen parametrenin tipi uyuşmuyor ({msg})";
+                default:
+                    return msg;
+            }
+        }
+
+        private static string ExtractFirstSingleQuoted(string text)
+        {
+            int first = text.IndexOf('\'');
+            if (first < 0 || first + 1 >= text.Length) return null;
+            int second = text.IndexOf('\'', first + 1);
+            if (second < 0) return null;
+            return text.Substring(first + 1, second - first - 1);
+        }
+
+        private static string ExtractSecondSingleQuoted(string text)
+        {
+            int first = text.IndexOf('\'');
+            if (first < 0 || first + 1 >= text.Length) return null;
+            int second = text.IndexOf('\'', first + 1);
+            if (second < 0 || second + 1 >= text.Length) return null;
+            int third = text.IndexOf('\'', second + 1);
+            if (third < 0 || third + 1 >= text.Length) return null;
+            int fourth = text.IndexOf('\'', third + 1);
+            if (fourth < 0) return null;
+            return text.Substring(third + 1, fourth - third - 1);
         }
     }
 }

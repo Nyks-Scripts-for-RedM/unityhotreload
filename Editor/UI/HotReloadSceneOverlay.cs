@@ -52,11 +52,12 @@ namespace Nyks.HotReload.Editor.UI
                 if (EditorWindow.focusedWindow != null &&
                     EditorWindow.focusedWindow.GetType().Name == "GameView")
                 {
+                    bool tr = HotReloadSessionManager.IsTurkish;
                     string msg = !evt.Success
-                        ? $"❌ Hot Reload Compile Error: {evt.ScriptName}"
+                        ? (tr ? $"📝 Kod Hatası ({evt.ScriptName})" : $"📝 C# Script Error: {evt.ScriptName}")
                         : (evt.RequiresDomainReload
-                            ? $"⚠️ Full Reload Needed ({evt.ScriptName}): {evt.ReloadReason}"
-                            : $"⚡ Hot Reloaded: {evt.ScriptName} ({evt.TotalTimeMs:F0}ms)");
+                            ? (tr ? $"⚠️ Tam Yenileme Gerekli ({evt.ScriptName}): {evt.ReloadReason}" : $"⚠️ Full Reload Needed ({evt.ScriptName}): {evt.ReloadReason}")
+                            : (tr ? $"⚡ Güncellendi: {evt.ScriptName} ({evt.TotalTimeMs:F0}ms)" : $"⚡ Hot Reloaded: {evt.ScriptName} ({evt.TotalTimeMs:F0}ms)"));
                     EditorWindow.focusedWindow.ShowNotification(new GUIContent(msg), 2.2);
                 }
             }
@@ -144,17 +145,21 @@ namespace Nyks.HotReload.Editor.UI
                 normal = { textColor = new Color(0.82f, 0.88f, 0.85f, alpha) }
             };
 
+            bool tr = HotReloadSessionManager.IsTurkish;
+
             string title = !_activeToastEvent.Success
-                ? $"❌ Compile Error: {_activeToastEvent.ScriptName}"
+                ? (tr ? $"📝 Kod Hatası: {_activeToastEvent.ScriptName}" : $"📝 Script Error: {_activeToastEvent.ScriptName}")
                 : (_activeToastEvent.RequiresDomainReload
-                    ? $"⚠️ Full Reload Needed: {_activeToastEvent.ScriptName}"
-                    : $"⚡ Hot Reloaded: {_activeToastEvent.ScriptName} ({_activeToastEvent.TotalTimeMs:F0}ms)");
+                    ? (tr ? $"⚠️ Tam Yenileme Gerekli: {_activeToastEvent.ScriptName}" : $"⚠️ Full Reload Needed: {_activeToastEvent.ScriptName}")
+                    : (tr ? $"⚡ Güncellendi: {_activeToastEvent.ScriptName} ({_activeToastEvent.TotalTimeMs:F0}ms)" : $"⚡ Hot Reloaded: {_activeToastEvent.ScriptName} ({_activeToastEvent.TotalTimeMs:F0}ms)"));
 
             string subtitle = !_activeToastEvent.Success
-                ? (_activeToastEvent.Diagnostics.Count > 0 ? _activeToastEvent.Diagnostics[0].Message : "Check Console / Hot Reload Pro window")
+                ? (_activeToastEvent.Diagnostics.Count > 0
+                    ? HotReloadSessionManager.FormatDiagnosticForUser(_activeToastEvent.Diagnostics[0], tr)
+                    : (tr ? "Yazdığın kodda hata var (Console'a bak)" : "Check Console / Hot Reload Pro window"))
                 : (_activeToastEvent.RequiresDomainReload
-                    ? $"{_activeToastEvent.ReloadReason} (Press Ctrl+Alt+R)"
-                    : $"{_activeToastEvent.PatchedMethods.Count} methods patched • {_activeToastEvent.AddedFields.Count} dynamic fields");
+                    ? (tr ? $"{_activeToastEvent.ReloadReason} (Ctrl+Alt+R)" : $"{_activeToastEvent.ReloadReason} (Press Ctrl+Alt+R)")
+                    : (tr ? $"{_activeToastEvent.PatchedMethods.Count} metot • {_activeToastEvent.AddedFields.Count} yeni değişken" : $"{_activeToastEvent.PatchedMethods.Count} methods patched • {_activeToastEvent.AddedFields.Count} dynamic fields"));
 
             GUI.Label(new Rect(boxRect.x + 12f, boxRect.y + 8f, boxRect.width - 20f, 20f), title, titleStyle);
             GUI.Label(new Rect(boxRect.x + 12f, boxRect.y + 28f, boxRect.width - 20f, 18f), subtitle, subStyle);
