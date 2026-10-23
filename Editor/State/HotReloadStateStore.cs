@@ -284,6 +284,58 @@ namespace Nyks.HotReload.Editor.State
         internal static Action<MonoBehaviour, string, float, float, bool> OnScheduleDynamicInvoke;
         internal static Action<MonoBehaviour, string> OnCancelDynamicInvoke;
         internal static Func<MonoBehaviour, string, bool> OnCheckDynamicIsInvoking;
+        internal static Func<MonoBehaviour, string, object, Coroutine> OnStartDynamicCoroutine;
+        internal static Action<MonoBehaviour, string> OnStopDynamicCoroutine;
+
+        /// <summary>
+        /// Routes MonoBehaviour.StartCoroutine(string) calls so newly added Hot Reload IEnumerator methods can be started by name without a Domain Reload.
+        /// </summary>
+        public static Coroutine StartCoroutine(MonoBehaviour instance, string methodName)
+        {
+            return StartCoroutine(instance, methodName, null);
+        }
+
+        /// <summary>
+        /// Routes MonoBehaviour.StartCoroutine(string, object) calls so newly added Hot Reload IEnumerator methods can be started by name without a Domain Reload.
+        /// </summary>
+        public static Coroutine StartCoroutine(MonoBehaviour instance, string methodName, object value)
+        {
+            if (instance == null || string.IsNullOrEmpty(methodName))
+            {
+                return null;
+            }
+
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            if (instance.GetType().GetMethod(methodName, flags) != null)
+            {
+                return value != null
+                    ? instance.StartCoroutine(methodName, value)
+                    : instance.StartCoroutine(methodName);
+            }
+
+            return OnStartDynamicCoroutine != null
+                ? OnStartDynamicCoroutine(instance, methodName, value)
+                : null;
+        }
+
+        /// <summary>
+        /// Routes MonoBehaviour.StopCoroutine(string) calls to stop both native and dynamically added Hot Reload coroutines.
+        /// </summary>
+        public static void StopCoroutine(MonoBehaviour instance, string methodName)
+        {
+            if (instance == null || string.IsNullOrEmpty(methodName))
+            {
+                return;
+            }
+
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            if (instance.GetType().GetMethod(methodName, flags) != null)
+            {
+                instance.StopCoroutine(methodName);
+            }
+
+            OnStopDynamicCoroutine?.Invoke(instance, methodName);
+        }
 
         /// <summary>
         /// Routes MonoBehaviour.Invoke calls so newly added Hot Reload methods execute on time without requiring a Domain Reload.

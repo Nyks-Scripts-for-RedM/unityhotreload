@@ -47,7 +47,8 @@ namespace Nyks.HotReload.Editor.Core
         public static SourceRewriteResult Rewrite(
             string sourceCode,
             IReadOnlyCollection<string> targetAssemblyNames,
-            Func<string, Type> runtimeTypeResolver)
+            Func<string, Type> runtimeTypeResolver,
+            bool emitSharedAssemblyBoilerplate = true)
         {
             var result = new SourceRewriteResult();
 
@@ -71,7 +72,7 @@ namespace Nyks.HotReload.Editor.Core
                 }
             }
 
-            // Build lookup of existing fields for the primary declared type so we know if the user added a new field.
+            // Build fallback lookup for the first declared type in the file.
             Type primaryOriginalType = null;
             HashSet<string> existingFieldNames = null;
             string primaryTypeFullName = null;
@@ -96,15 +97,16 @@ namespace Nyks.HotReload.Editor.Core
 
             // 1. Emit [assembly: IgnoresAccessChecksTo("...")] before any namespace/type declarations,
             //    immediately after top-level using directives and #define/#pragma directives.
-            int headerInsertIndex = FindHeaderInsertionLine(lines);
+            int headerInsertIndex = emitSharedAssemblyBoilerplate ? FindHeaderInsertionLine(lines) : -1;
 
             int braceDepth = 0;
             bool insideClass = false;
             int classBraceDepth = -1;
+            var pendingAttributeLines = new List<string>(4);
 
             for (int i = 0; i < lines.Length; i++)
             {
-                if (i == headerInsertIndex)
+                if (emitSharedAssemblyBoilerplate && i == headerInsertIndex)
                 {
                     EmitAccessChecksAttributes(sb, targetAssemblyNames);
                 }
@@ -113,13 +115,38 @@ namespace Nyks.HotReload.Editor.Core
                 string trimmed = line.Trim();
 
                 // Track class scope depth so we only inspect class-level field declarations (not local variables inside methods).
-                if (!insideClass && _classDeclRegex.IsMatch(line) && !trimmed.StartsWith("//", StringComparison.Ordinal))
+                if (!insideClass && !trimmed.StartsWith("//", StringComparison.Ordinal))
                 {
-                    insideClass = true;
-                    classBraceDepth = braceDepth + CountChar(line, '{') - CountChar(line, '}');
-                    if (!line.Contains("{"))
+                    Match clsMatch = _classDeclRegex.Match(line);
+                    if (clsMatch.Success)
                     {
-                        classBraceDepth = braceDepth + 1;
+                        insideClass = true;
+                        classBraceDepth = braceDepth + CountChar(line, '{') - CountChar(line, '}');
+                        if (!line.Contains("{"))
+                        {
+                            classBraceDepth = braceDepth + 1;
+                        }
+
+                        if (runtimeTypeResolver != null)
+                        {
+                            string shortClassName = clsMatch.Groups[1].Value.Trim();
+                            string candidateFullName = string.IsNullOrEmpty(detectedNamespace)
+                                ? shortClassName
+                                : $"{detectedNamespace}.{shortClassName}";
+                            Type resolvedClass = runtimeTypeResolver(candidateFullName);
+                            if (resolvedClass != null)
+                            {
+                                primaryOriginalType = resolvedClass;
+                                primaryTypeFullName = resolvedClass.FullName ?? candidateFullName;
+                                existingFieldNames = GetExistingFieldNames(resolvedClass);
+                            }
+                            else
+                            {
+                                primaryOriginalType = null;
+                                primaryTypeFullName = candidateFullName;
+                                existingFieldNames = null;
+                            }
+                        }
                     }
                 }
 
@@ -128,19 +155,57 @@ namespace Nyks.HotReload.Editor.Core
 
                 bool isAtClassFieldLevel = insideClass && (braceDepth == classBraceDepth) && openBraces == 0 && closeBraces == 0;
 
+                // Buffer standalone attribute lines (e.g. [Header("...")], [SerializeField]) at class field level
+                // so that if the following line is a newly added field rewritten into a property, we comment out
+                // field-only attributes to prevent CS0592 while keeping exact line numbers intact.
+                if (isAtClassFieldLevel &&
+                    trimmed.StartsWith("[", StringComparison.Ordinal) &&
+                    trimmed.EndsWith("]", StringComparison.Ordinal) &&
+                    !trimmed.StartsWith("[assembly:", StringComparison.Ordinal))
+                {
+                    pendingAttributeLines.Add(line);
+                    braceDepth += openBraces - closeBraces;
+                    continue;
+                }
+
                 if (isAtClassFieldLevel && primaryOriginalType != null && existingFieldNames != null)
                 {
+                    bool hadSerializeAttrOnPrevLine = false;
+                    for (int a = 0; a < pendingAttributeLines.Count; a++)
+                    {
+                        if (pendingAttributeLines[a].Contains("SerializeField"))
+                        {
+                            hadSerializeAttrOnPrevLine = true;
+                            break;
+                        }
+                    }
+
                     if (TryRewriteNewFieldLine(
                         line,
                         primaryTypeFullName,
                         existingFieldNames,
                         result.AddedFields,
-                        out string rewrittenLine))
+                        out string rewrittenLine,
+                        hadSerializeAttrOnPrevLine))
                     {
+                        for (int a = 0; a < pendingAttributeLines.Count; a++)
+                        {
+                            sb.AppendLine("// " + pendingAttributeLines[a]);
+                        }
+                        pendingAttributeLines.Clear();
                         sb.AppendLine(rewrittenLine);
                         braceDepth += openBraces - closeBraces;
                         continue;
                     }
+                }
+
+                if (pendingAttributeLines.Count > 0)
+                {
+                    for (int a = 0; a < pendingAttributeLines.Count; a++)
+                    {
+                        sb.AppendLine(pendingAttributeLines[a]);
+                    }
+                    pendingAttributeLines.Clear();
                 }
 
                 int nextBraceDepth = braceDepth + openBraces - closeBraces;
@@ -155,6 +220,12 @@ namespace Nyks.HotReload.Editor.Core
                         sb.AppendLine("    [System.Runtime.CompilerServices.CompilerGenerated] private new void CancelInvoke(string methodName) => global::Nyks.HotReload.Editor.State.HotReloadStateStore.CancelInvoke(this, methodName);");
                         sb.AppendLine("    [System.Runtime.CompilerServices.CompilerGenerated] private new bool IsInvoking() => global::Nyks.HotReload.Editor.State.HotReloadStateStore.IsInvoking(this);");
                         sb.AppendLine("    [System.Runtime.CompilerServices.CompilerGenerated] private new bool IsInvoking(string methodName) => global::Nyks.HotReload.Editor.State.HotReloadStateStore.IsInvoking(this, methodName);");
+                        sb.AppendLine("    [System.Runtime.CompilerServices.CompilerGenerated] private new global::UnityEngine.Coroutine StartCoroutine(global::System.Collections.IEnumerator routine) => base.StartCoroutine(routine);");
+                        sb.AppendLine("    [System.Runtime.CompilerServices.CompilerGenerated] private new global::UnityEngine.Coroutine StartCoroutine(string methodName) => global::Nyks.HotReload.Editor.State.HotReloadStateStore.StartCoroutine(this, methodName);");
+                        sb.AppendLine("    [System.Runtime.CompilerServices.CompilerGenerated] private new global::UnityEngine.Coroutine StartCoroutine(string methodName, object value) => global::Nyks.HotReload.Editor.State.HotReloadStateStore.StartCoroutine(this, methodName, value);");
+                        sb.AppendLine("    [System.Runtime.CompilerServices.CompilerGenerated] private new void StopCoroutine(global::System.Collections.IEnumerator routine) => base.StopCoroutine(routine);");
+                        sb.AppendLine("    [System.Runtime.CompilerServices.CompilerGenerated] private new void StopCoroutine(global::UnityEngine.Coroutine routine) => base.StopCoroutine(routine);");
+                        sb.AppendLine("    [System.Runtime.CompilerServices.CompilerGenerated] private new void StopCoroutine(string methodName) => global::Nyks.HotReload.Editor.State.HotReloadStateStore.StopCoroutine(this, methodName);");
                     }
                     insideClass = false;
                 }
@@ -163,22 +234,34 @@ namespace Nyks.HotReload.Editor.Core
                 braceDepth = nextBraceDepth;
             }
 
-            if (headerInsertIndex >= lines.Length)
+            if (pendingAttributeLines.Count > 0)
             {
-                EmitAccessChecksAttributes(sb, targetAssemblyNames);
+                for (int a = 0; a < pendingAttributeLines.Count; a++)
+                {
+                    sb.AppendLine(pendingAttributeLines[a]);
+                }
+                pendingAttributeLines.Clear();
             }
 
-            // Append the internal IgnoresAccessChecksToAttribute definition at the very end of the compilation unit.
-            sb.AppendLine();
-            sb.AppendLine("namespace System.Runtime.CompilerServices");
-            sb.AppendLine("{");
-            sb.AppendLine("    [System.AttributeUsage(System.AttributeTargets.Assembly, AllowMultiple = true)]");
-            sb.AppendLine("    internal sealed class IgnoresAccessChecksToAttribute : System.Attribute");
-            sb.AppendLine("    {");
-            sb.AppendLine("        public IgnoresAccessChecksToAttribute(string assemblyName) { AssemblyName = assemblyName; }");
-            sb.AppendLine("        public string AssemblyName { get; }");
-            sb.AppendLine("    }");
-            sb.AppendLine("}");
+            if (emitSharedAssemblyBoilerplate)
+            {
+                if (headerInsertIndex >= lines.Length)
+                {
+                    EmitAccessChecksAttributes(sb, targetAssemblyNames);
+                }
+
+                // Append the internal IgnoresAccessChecksToAttribute definition at the very end of the compilation unit.
+                sb.AppendLine();
+                sb.AppendLine("namespace System.Runtime.CompilerServices");
+                sb.AppendLine("{");
+                sb.AppendLine("    [System.AttributeUsage(System.AttributeTargets.Assembly, AllowMultiple = true)]");
+                sb.AppendLine("    internal sealed class IgnoresAccessChecksToAttribute : System.Attribute");
+                sb.AppendLine("    {");
+                sb.AppendLine("        public IgnoresAccessChecksToAttribute(string assemblyName) { AssemblyName = assemblyName; }");
+                sb.AppendLine("        public string AssemblyName { get; }");
+                sb.AppendLine("    }");
+                sb.AppendLine("}");
+            }
 
             result.RewrittenSource = sb.ToString();
             return result;
@@ -189,7 +272,8 @@ namespace Nyks.HotReload.Editor.Core
             string ownerTypeFullName,
             HashSet<string> existingFields,
             List<DynamicFieldDescriptor> addedFieldsOut,
-            out string rewrittenLine)
+            out string rewrittenLine,
+            bool hadPrecedingSerializeFieldAttribute = false)
         {
             rewrittenLine = null;
             string trimmed = line.Trim();
@@ -256,7 +340,7 @@ namespace Nyks.HotReload.Editor.Core
             }
 
             bool isStatic = mods.Contains("static");
-            bool isPublicOrSerialized = mods.Contains("public") || attrs.Contains("SerializeField");
+            bool isPublicOrSerialized = mods.Contains("public") || attrs.Contains("SerializeField") || hadPrecedingSerializeFieldAttribute;
             string cleanMods = mods.Replace("readonly", "").Replace("volatile", "").Trim();
 
             var propBuilder = new StringBuilder();

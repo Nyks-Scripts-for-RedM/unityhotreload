@@ -100,6 +100,20 @@ namespace Nyks.HotReload.Editor.Core
             public bool IsRepeating;
         }
 
+        private sealed class DynamicAddedCoroutine
+        {
+            public Type OriginalComponentType;
+            public string MethodName;
+            public MethodInfo PatchMethod;
+        }
+
+        private sealed class DynamicRunningCoroutine
+        {
+            public MonoBehaviour Instance;
+            public string MethodName;
+            public Coroutine Handle;
+        }
+
         private static readonly Dictionary<string, DynamicLifecycleHook> _dynamicLifecycleHooks =
             new Dictionary<string, DynamicLifecycleHook>(StringComparer.Ordinal);
 
@@ -108,6 +122,12 @@ namespace Nyks.HotReload.Editor.Core
 
         private static readonly List<DynamicScheduledInvoke> _dynamicScheduledInvokes =
             new List<DynamicScheduledInvoke>(16);
+
+        private static readonly Dictionary<string, DynamicAddedCoroutine> _dynamicAddedCoroutines =
+            new Dictionary<string, DynamicAddedCoroutine>(StringComparer.Ordinal);
+
+        private static readonly List<DynamicRunningCoroutine> _dynamicRunningCoroutines =
+            new List<DynamicRunningCoroutine>(16);
 
         private static readonly HashSet<string> _unityNativeMessagesRequiringReload = new HashSet<string>(StringComparer.Ordinal)
         {
@@ -123,6 +143,7 @@ namespace Nyks.HotReload.Editor.Core
         private static bool _autoRefreshLockedByUs;
         private static bool _isPerformingFullReload;
         private static bool _initialBaselineComplete;
+        private static bool _newScriptFileCreated;
         private static double _lastPollTime;
         private static string _lastModifiedScriptPath;
         private static bool _warmedUp;
@@ -284,6 +305,8 @@ namespace Nyks.HotReload.Editor.Core
             HotReloadStateStore.OnScheduleDynamicInvoke = ScheduleDynamicInvoke;
             HotReloadStateStore.OnCancelDynamicInvoke = CancelDynamicInvoke;
             HotReloadStateStore.OnCheckDynamicIsInvoking = CheckDynamicIsInvoking;
+            HotReloadStateStore.OnStartDynamicCoroutine = StartDynamicCoroutine;
+            HotReloadStateStore.OnStopDynamicCoroutine = StopDynamicCoroutine;
 
             // Immediately initialize file baseline and lock kAutoRefresh preferences during InitializeOnLoad
             // so scripts edited in an external IDE while Unity is unfocused in the background are never missed
@@ -305,6 +328,7 @@ namespace Nyks.HotReload.Editor.Core
                 EnsureIdeProjectFilesSynced(force: false);
             };
         }
+
         /// <summary>
         /// Manually triggers compilation and hot-patching for the specified C# script path (works in both Edit Mode and Play Mode).
         /// </summary>
@@ -315,16 +339,52 @@ namespace Nyks.HotReload.Editor.Core
                 return null;
             }
 
-            _lastModifiedScriptPath = scriptPath;
+            return PatchScriptsBatchNow(new[] { scriptPath });
+        }
+
+        /// <summary>
+        /// Compiles and hot-patches one or more modified C# scripts together in a single compilation pass.
+        /// Eliminates sequential multi-script compilation delays and resolves cross-file dependencies cleanly.
+        /// </summary>
+        public static HotReloadPatchEvent PatchScriptsBatchNow(IReadOnlyList<string> scriptPaths)
+        {
+            if (scriptPaths == null || scriptPaths.Count == 0)
+            {
+                return null;
+            }
+
+            var validPaths = new List<string>(scriptPaths.Count);
+            var scriptNames = new List<string>(scriptPaths.Count);
+            for (int i = 0; i < scriptPaths.Count; i++)
+            {
+                string p = scriptPaths[i];
+                if (!string.IsNullOrEmpty(p) && File.Exists(p))
+                {
+                    validPaths.Add(p);
+                    scriptNames.Add(Path.GetFileName(p));
+                }
+            }
+
+            if (validPaths.Count == 0)
+            {
+                return null;
+            }
+
+            string primaryPath = validPaths[validPaths.Count - 1];
+            _lastModifiedScriptPath = primaryPath;
+            string combinedDisplayName = scriptNames.Count == 1
+                ? scriptNames[0]
+                : string.Join(", ", scriptNames);
+
             var totalSw = System.Diagnostics.Stopwatch.StartNew();
 
-            HotReloadCompileResult compileResult = HotReloadCompilerService.CompileScriptFile(scriptPath);
+            HotReloadCompileResult compileResult = HotReloadCompilerService.CompileScriptBatch(validPaths);
 
             var evt = new HotReloadPatchEvent
             {
                 TimestampLocal = DateTime.Now,
-                ScriptName = Path.GetFileName(scriptPath),
-                ScriptPath = scriptPath,
+                ScriptName = combinedDisplayName,
+                ScriptPath = primaryPath,
                 CompilerEngine = compileResult.EngineUsed ?? "Roslyn"
             };
 
@@ -380,7 +440,7 @@ namespace Nyks.HotReload.Editor.Core
 
             // If we are in Edit Mode (not playing) and the user made a structural change
             // (e.g. added `: ICollectible`, added a new class, added a new public/interface method, or added OnTriggerEnter),
-            // automatically trigger a clean Unity compilation so the user never has to manually click Full Reload!
+            // automatically trigger a single clean Unity compilation so the user never has to manually click Full Reload!
             if (!EditorApplication.isPlaying && evt.RequiresDomainReload)
             {
                 Debug.Log(IsTurkish
@@ -392,7 +452,10 @@ namespace Nyks.HotReload.Editor.Core
 
             if (patchedCount > 0 || evt.AddedFields.Count > 0 || evt.RequiresDomainReload)
             {
-                _dirtyScriptsSinceDomainReload.Add(scriptPath);
+                for (int i = 0; i < validPaths.Count; i++)
+                {
+                    _dirtyScriptsSinceDomainReload.Add(validPaths[i]);
+                }
                 RecordEvent(evt);
             }
 
@@ -408,17 +471,21 @@ namespace Nyks.HotReload.Editor.Core
         /// </summary>
         public static int RevertAllPatches()
         {
-            if (_dynamicLifecycleHooks.Count > 0 || _dynamicAddedMethods.Count > 0 || _dynamicScheduledInvokes.Count > 0)
-            {
-                Application.onBeforeRender -= OnBeforeRenderDynamicUpdates;
-                _dynamicLifecycleHooks.Clear();
-                _dynamicAddedMethods.Clear();
-                _dynamicScheduledInvokes.Clear();
-            }
+            ClearAllDynamicRuntimeState();
             int count = NativeMethodDetour.RevertAll();
             HotReloadStateStore.ClearAll();
             OnStatusChanged?.Invoke();
             return count;
+        }
+
+        private static void ClearAllDynamicRuntimeState()
+        {
+            Application.onBeforeRender -= OnBeforeRenderDynamicUpdates;
+            _dynamicLifecycleHooks.Clear();
+            _dynamicAddedMethods.Clear();
+            _dynamicScheduledInvokes.Clear();
+            _dynamicAddedCoroutines.Clear();
+            _dynamicRunningCoroutines.Clear();
         }
 
         /// <summary>
@@ -433,20 +500,19 @@ namespace Nyks.HotReload.Editor.Core
             _isPerformingFullReload = true;
             ReleaseAutoRefreshLock();
 
-            if (_dynamicLifecycleHooks.Count > 0 || _dynamicAddedMethods.Count > 0 || _dynamicScheduledInvokes.Count > 0)
-            {
-                Application.onBeforeRender -= OnBeforeRenderDynamicUpdates;
-                _dynamicLifecycleHooks.Clear();
-                _dynamicAddedMethods.Clear();
-                _dynamicScheduledInvokes.Clear();
-            }
+            ClearAllDynamicRuntimeState();
             NativeMethodDetour.RevertAll();
             HotReloadStateStore.ClearAll();
 
             EditorApplication.delayCall += () =>
             {
+                if (_newScriptFileCreated)
+                {
+                    _newScriptFileCreated = false;
+                    EnsureIdeProjectFilesSynced(force: true);
+                }
+
                 AssetDatabase.Refresh(ImportAssetOptions.Default);
-                EnsureIdeProjectFilesSynced(force: true);
 
                 // AssetDatabase.Refresh synchronously sets EditorApplication.isCompiling = true if any .cs file changed on disk.
                 // Only call RequestScriptReload when no script compilation was queued; otherwise RequestScriptReload
@@ -599,8 +665,9 @@ namespace Nyks.HotReload.Editor.Core
                     }
                     else
                     {
-                        // Newly created script file: record baseline and let Unity register new MonoScript if in Edit Mode
+                        // Newly created script file: record baseline and mark for IDE .csproj sync
                         _scriptLastWriteTicks[filePath] = currentTicks;
+                        _newScriptFileCreated = true;
                         if (EditorApplication.isPlaying || AllowEditModePatching)
                         {
                             QueueScriptChange(filePath);
@@ -647,7 +714,7 @@ namespace Nyks.HotReload.Editor.Core
                 return;
             }
 
-            // Pre-resolve DotNetSdk paths 1.0s after Editor domain reload
+            // Pre-resolve compiler paths and warm up metadata cache 1.0s after Editor domain reload
             if (!_warmedUp && EditorApplication.timeSinceStartup - _startupTime > 1.0)
             {
                 _warmedUp = true;
@@ -693,13 +760,24 @@ namespace Nyks.HotReload.Editor.Core
                 }
             }
 
+            if (readyPaths.Count == 0)
+            {
+                return;
+            }
+
+            var validBatchPaths = new List<string>(readyPaths.Count);
             foreach (string path in readyPaths)
             {
                 _pendingFiles.TryRemove(path, out _);
                 if (File.Exists(path))
                 {
-                    PatchScriptNow(path);
+                    validBatchPaths.Add(path);
                 }
+            }
+
+            if (validBatchPaths.Count > 0)
+            {
+                PatchScriptsBatchNow(validBatchPaths);
             }
         }
 
@@ -738,13 +816,7 @@ namespace Nyks.HotReload.Editor.Core
         private static void OnBeforeAssemblyReload()
         {
             DisposeFileWatcher();
-            if (_dynamicLifecycleHooks.Count > 0 || _dynamicAddedMethods.Count > 0 || _dynamicScheduledInvokes.Count > 0)
-            {
-                Application.onBeforeRender -= OnBeforeRenderDynamicUpdates;
-                _dynamicLifecycleHooks.Clear();
-                _dynamicAddedMethods.Clear();
-                _dynamicScheduledInvokes.Clear();
-            }
+            ClearAllDynamicRuntimeState();
             NativeMethodDetour.ClearOnDomainUnload();
             HotReloadStateStore.ClearAll();
 
@@ -881,6 +953,8 @@ namespace Nyks.HotReload.Editor.Core
                     continue;
                 }
 
+                // Compiler-generated nested types (<Coroutine>d__N, <>c, <>c__DisplayClass) are matched and detoured
+                // via their declaring parent type below so ordinal shifts (d__3 -> d__4) never cause false NewType reloads.
                 if (patchType.IsNested && patchType.Name.StartsWith("<", StringComparison.Ordinal))
                 {
                     continue;
@@ -970,16 +1044,31 @@ namespace Nyks.HotReload.Editor.Core
 
                     if (patchMethod.IsDefined(typeof(System.Runtime.CompilerServices.CompilerGeneratedAttribute), false))
                     {
+                        if (IsRewriterInjectedHelper(patchMethod))
+                        {
+                            continue;
+                        }
+
+                        // If this is a compiler-generated lambda method on the class (e.g. <Awake>b__5_0 or <OnResumeButtonClicked>b__11_0)
+                        // or an existing auto-property accessor, detour it if a matching method exists on originalType!
+                        MethodInfo matchingCgMethod = FindMatchingCompilerGeneratedMethod(originalType, patchMethod, flags);
+                        if (matchingCgMethod != null && NativeMethodDetour.TryDetour(matchingCgMethod, patchMethod, out _))
+                        {
+                            patchedCount++;
+                            patchedMethodNamesOut.Add($"{originalType.Name}.{patchMethod.Name}");
+                        }
                         continue;
                     }
 
                     MethodInfo originalMethod = FindMatchingOriginalMethod(originalType, patchMethod, flags);
                     if (originalMethod == null)
                     {
-                        if (!patchMethod.IsStatic && patchMethod.GetParameters().Length == 0 &&
-                            typeof(MonoBehaviour).IsAssignableFrom(originalType))
+                        bool isMonoBehaviour = typeof(MonoBehaviour).IsAssignableFrom(originalType);
+
+                        if (isMonoBehaviour && !patchMethod.IsStatic)
                         {
-                            if (patchMethod.Name == "Update" || patchMethod.Name == "LateUpdate" || patchMethod.Name == "FixedUpdate")
+                            if (patchMethod.GetParameters().Length == 0 &&
+                                (patchMethod.Name == "Update" || patchMethod.Name == "LateUpdate" || patchMethod.Name == "FixedUpdate"))
                             {
                                 if (TryRegisterDynamicLifecycleHook(originalType, patchMethod))
                                 {
@@ -999,19 +1088,41 @@ namespace Nyks.HotReload.Editor.Core
                                     "Because this method did not exist when Unity last built its native C++ callback table, click <b>Tools > Hot Reload Pro > Full Domain Reload</b> (or press <b>Ctrl+Alt+R</b>) once.");
                                 continue;
                             }
+                        }
 
-                            if (patchMethod.IsPrivate &&
-                                patchMethod.ReturnType == typeof(void) &&
-                                TryRegisterDynamicAddedMethod(originalType, patchMethod))
+                        // Support newly added IEnumerator Coroutine methods (both StartCoroutine(MyRoutine()) and StartCoroutine("MyRoutine"))
+                        if (typeof(System.Collections.IEnumerator).IsAssignableFrom(patchMethod.ReturnType))
+                        {
+                            if (isMonoBehaviour && !patchMethod.IsStatic)
+                            {
+                                TryRegisterDynamicAddedCoroutine(originalType, patchMethod);
+                            }
+
+                            if (patchMethod.IsPrivate || EditorApplication.isPlaying)
                             {
                                 patchedCount++;
-                                patchedMethodNamesOut.Add($"{originalType.Name}.{patchMethod.Name} (Dynamic Method)");
+                                patchedMethodNamesOut.Add($"{originalType.Name}.{patchMethod.Name} (New Coroutine)");
                                 continue;
                             }
                         }
 
+                        // Any newly added private method (with or without parameters, void or non-void, static or instance)
+                        // is called directly by other patched methods/delegates within the same class and NEVER requires a Domain Reload!
+                        if (patchMethod.IsPrivate)
+                        {
+                            if (isMonoBehaviour && !patchMethod.IsStatic &&
+                                patchMethod.GetParameters().Length == 0 && patchMethod.ReturnType == typeof(void))
+                            {
+                                TryRegisterDynamicAddedMethod(originalType, patchMethod);
+                            }
+
+                            patchedCount++;
+                            patchedMethodNamesOut.Add($"{originalType.Name}.{patchMethod.Name} (New Private Method)");
+                            continue;
+                        }
+
                         // Any new non-private method (e.g. interface implementation `public void Collect()`)
-                        // or method with parameters/return value requires a Domain Reload to exist in runtime metadata
+                        // requires a Domain Reload in Edit Mode (or advisory in Play Mode) to exist in external metadata
                         requiresDomainReload = true;
                         if (string.IsNullOrEmpty(reloadReason))
                         {
@@ -1038,10 +1149,303 @@ namespace Nyks.HotReload.Editor.Core
                             IsError = false
                         });
                     }
+
+                    // If this method is an IEnumerator Coroutine or Async state-machine method, also detour its MoveNext()
+                    // on the compiler-generated state machine class (<MethodName>d__N) when field layouts are compatible,
+                    // so even already-running Coroutines (e.g. while(true) loops) update live on their next yield!
+                    if (TryDetourStateMachineMoveNext(originalType, patchType, originalMethod, patchMethod, flags))
+                    {
+                        patchedCount++;
+                        patchedMethodNamesOut.Add($"{originalType.Name}.{originalMethod.Name}.MoveNext (Coroutine)");
+                    }
                 }
+
+                // Also detour nested closure/lambda classes (<>c and <>c__DisplayClass) for this type
+                patchedCount += ApplyNestedClosureDetours(originalType, patchType, flags, patchedMethodNamesOut);
             }
 
             return patchedCount;
+        }
+
+        private static bool IsRewriterInjectedHelper(MethodInfo method)
+        {
+            string name = method.Name;
+            if (name == "Invoke" || name == "InvokeRepeating" || name == "CancelInvoke" || name == "IsInvoking" ||
+                name == "StartCoroutine" || name == "StopCoroutine")
+            {
+                return true;
+            }
+
+            if (name.StartsWith("get_", StringComparison.Ordinal) || name.StartsWith("set_", StringComparison.Ordinal))
+            {
+                string propName = name.Substring(4);
+                string declaringFullName = method.DeclaringType != null ? method.DeclaringType.FullName : null;
+                if (!string.IsNullOrEmpty(declaringFullName))
+                {
+                    IReadOnlyList<DynamicFieldDescriptor> dynFields = HotReloadStateStore.GetDynamicFieldsForType(declaringFullName);
+                    for (int i = 0; i < dynFields.Count; i++)
+                    {
+                        if (string.Equals(dynFields[i].FieldName, propName, StringComparison.Ordinal))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static MethodInfo FindMatchingCompilerGeneratedMethod(Type originalType, MethodInfo patchMethod, BindingFlags flags)
+        {
+            // Direct exact name + signature match first
+            MethodInfo exact = FindMatchingOriginalMethod(originalType, patchMethod, flags);
+            if (exact != null)
+            {
+                return exact;
+            }
+
+            // If it's a lambda method <ParentMethod>b__X_Y and ordinal X shifted, match by <ParentMethod>b__ prefix if unambiguous
+            string name = patchMethod.Name;
+            int closeBracket = name.IndexOf(">b__", StringComparison.Ordinal);
+            if (name.StartsWith("<", StringComparison.Ordinal) && closeBracket > 1)
+            {
+                string prefix = name.Substring(0, closeBracket + 4); // "<ParentMethod>b__"
+                MethodInfo[] candidates = originalType.GetMethods(flags);
+                MethodInfo singleMatch = null;
+                int matchCount = 0;
+
+                foreach (MethodInfo cand in candidates)
+                {
+                    if (cand.Name.StartsWith(prefix, StringComparison.Ordinal) &&
+                        cand.IsStatic == patchMethod.IsStatic &&
+                        AreMethodSignaturesEqual(cand, patchMethod))
+                    {
+                        singleMatch = cand;
+                        matchCount++;
+                    }
+                }
+
+                if (matchCount == 1)
+                {
+                    return singleMatch;
+                }
+            }
+
+            return null;
+        }
+
+        private static bool TryDetourStateMachineMoveNext(
+            Type originalType,
+            Type patchType,
+            MethodInfo originalMethod,
+            MethodInfo patchMethod,
+            BindingFlags flags)
+        {
+            try
+            {
+                Type origSmType = FindStateMachineNestedType(originalType, originalMethod);
+                Type patchSmType = FindStateMachineNestedType(patchType, patchMethod);
+
+                if (origSmType == null || patchSmType == null)
+                {
+                    return false;
+                }
+
+                if (origSmType.IsGenericTypeDefinition || patchSmType.IsGenericTypeDefinition)
+                {
+                    return false;
+                }
+
+                // Verify that the state machine's instance fields (e.g. <>1__state, <>2__current, <>4__this, and hoisted locals)
+                // have a compatible memory layout before detouring MoveNext() for already-running instances.
+                if (!AreInstanceFieldLayoutsCompatible(origSmType, patchSmType))
+                {
+                    return false;
+                }
+
+                MethodInfo origMoveNext = origSmType.GetMethod("MoveNext", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                MethodInfo patchMoveNext = patchSmType.GetMethod("MoveNext", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+
+                if (origMoveNext == null || patchMoveNext == null)
+                {
+                    return false;
+                }
+
+                return NativeMethodDetour.TryDetour(origMoveNext, patchMoveNext, out _);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static Type FindStateMachineNestedType(Type ownerType, MethodInfo method)
+        {
+            if (ownerType == null || method == null)
+            {
+                return null;
+            }
+
+            // 1. Check [IteratorStateMachine] and [AsyncStateMachine] attributes first
+            var iterAttr = method.GetCustomAttribute<System.Runtime.CompilerServices.IteratorStateMachineAttribute>();
+            if (iterAttr != null && iterAttr.StateMachineType != null)
+            {
+                return iterAttr.StateMachineType;
+            }
+
+            var asyncAttr = method.GetCustomAttribute<System.Runtime.CompilerServices.AsyncStateMachineAttribute>();
+            if (asyncAttr != null && asyncAttr.StateMachineType != null)
+            {
+                return asyncAttr.StateMachineType;
+            }
+
+            // 2. Fallback: look for nested type named "<MethodName>d__*"
+            string prefix = $"<{method.Name}>d__";
+            Type[] nestedTypes = ownerType.GetNestedTypes(BindingFlags.Public | BindingFlags.NonPublic);
+            Type match = null;
+            int count = 0;
+            for (int i = 0; i < nestedTypes.Length; i++)
+            {
+                if (nestedTypes[i].Name.StartsWith(prefix, StringComparison.Ordinal))
+                {
+                    match = nestedTypes[i];
+                    count++;
+                }
+            }
+
+            return count == 1 ? match : null;
+        }
+
+        private static int ApplyNestedClosureDetours(
+            Type originalType,
+            Type patchType,
+            BindingFlags flags,
+            List<string> patchedMethodNamesOut)
+        {
+            int count = 0;
+            try
+            {
+                Type[] origNested = originalType.GetNestedTypes(BindingFlags.Public | BindingFlags.NonPublic);
+                Type[] patchNested = patchType.GetNestedTypes(BindingFlags.Public | BindingFlags.NonPublic);
+
+                if (origNested == null || patchNested == null || origNested.Length == 0 || patchNested.Length == 0)
+                {
+                    return 0;
+                }
+
+                foreach (Type pNested in patchNested)
+                {
+                    if (pNested == null || pNested.IsGenericTypeDefinition || !pNested.Name.StartsWith("<>c", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    Type oNested = null;
+                    if (pNested.Name == "<>c")
+                    {
+                        for (int i = 0; i < origNested.Length; i++)
+                        {
+                            if (origNested[i] != null && origNested[i].Name == "<>c")
+                            {
+                                oNested = origNested[i];
+                                break;
+                            }
+                        }
+                    }
+                    else if (pNested.Name.StartsWith("<>c__DisplayClass", StringComparison.Ordinal))
+                    {
+                        for (int i = 0; i < origNested.Length; i++)
+                        {
+                            if (origNested[i] != null &&
+                                origNested[i].Name == pNested.Name &&
+                                AreInstanceFieldLayoutsCompatible(origNested[i], pNested))
+                            {
+                                oNested = origNested[i];
+                                break;
+                            }
+                        }
+                    }
+
+                    if (oNested == null)
+                    {
+                        continue;
+                    }
+
+                    MethodInfo[] pMethods = pNested.GetMethods(flags);
+                    foreach (MethodInfo pm in pMethods)
+                    {
+                        if (pm.IsAbstract || pm.ContainsGenericParameters || pm.IsSpecialName)
+                        {
+                            continue;
+                        }
+
+                        MethodInfo om = FindMatchingCompilerGeneratedMethod(oNested, pm, flags);
+                        if (om != null && NativeMethodDetour.TryDetour(om, pm, out _))
+                        {
+                            count++;
+                            patchedMethodNamesOut.Add($"{originalType.Name}.{pm.Name}");
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Non-fatal if closure matching fails
+            }
+            return count;
+        }
+
+        private static bool AreInstanceFieldLayoutsCompatible(Type typeA, Type typeB)
+        {
+            const BindingFlags instFlags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
+            FieldInfo[] fieldsA = typeA.GetFields(instFlags);
+            FieldInfo[] fieldsB = typeB.GetFields(instFlags);
+
+            if (fieldsA.Length != fieldsB.Length)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < fieldsA.Length; i++)
+            {
+                Type ftA = fieldsA[i].FieldType;
+                Type ftB = fieldsB[i].FieldType;
+                if (ftA != ftB && !string.Equals(ftA.FullName, ftB.FullName, StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static bool AreMethodSignaturesEqual(MethodInfo a, MethodInfo b)
+        {
+            if (a.ReturnType != b.ReturnType &&
+                !string.Equals(a.ReturnType.FullName, b.ReturnType.FullName, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            ParameterInfo[] pa = a.GetParameters();
+            ParameterInfo[] pb = b.GetParameters();
+            if (pa.Length != pb.Length)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < pa.Length; i++)
+            {
+                Type tA = pa[i].ParameterType;
+                Type tB = pb[i].ParameterType;
+                if (tA != tB && !string.Equals(tA.FullName, tB.FullName, StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         private static Type FindOriginalRuntimeType(Type patchType)
@@ -1172,6 +1576,91 @@ namespace Nyks.HotReload.Editor.Core
             catch
             {
                 return false;
+            }
+        }
+
+        private static bool TryRegisterDynamicAddedCoroutine(Type originalType, MethodInfo patchMethod)
+        {
+            if (originalType == null || patchMethod == null)
+            {
+                return false;
+            }
+
+            string key = $"{originalType.FullName}.{patchMethod.Name}";
+            _dynamicAddedCoroutines[key] = new DynamicAddedCoroutine
+            {
+                OriginalComponentType = originalType,
+                MethodName = patchMethod.Name,
+                PatchMethod = patchMethod
+            };
+            return true;
+        }
+
+        private static Coroutine StartDynamicCoroutine(MonoBehaviour instance, string methodName, object value)
+        {
+            if (instance == null || string.IsNullOrEmpty(methodName))
+            {
+                return null;
+            }
+
+            string key = $"{instance.GetType().FullName}.{methodName}";
+            if (!_dynamicAddedCoroutines.TryGetValue(key, out DynamicAddedCoroutine item) || item == null || item.PatchMethod == null)
+            {
+                return null;
+            }
+
+            try
+            {
+                ParameterInfo[] ps = item.PatchMethod.GetParameters();
+                object[] args = ps.Length == 0 ? null : new object[] { value };
+                if (item.PatchMethod.Invoke(instance, args) is System.Collections.IEnumerator routine)
+                {
+                    Coroutine handle = instance.StartCoroutine(routine);
+                    if (handle != null)
+                    {
+                        _dynamicRunningCoroutines.Add(new DynamicRunningCoroutine
+                        {
+                            Instance = instance,
+                            MethodName = methodName,
+                            Handle = handle
+                        });
+                    }
+                    return handle;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogException(ex, instance);
+            }
+
+            return null;
+        }
+
+        private static void StopDynamicCoroutine(MonoBehaviour instance, string methodName)
+        {
+            if (instance == null || string.IsNullOrEmpty(methodName))
+            {
+                return;
+            }
+
+            for (int i = _dynamicRunningCoroutines.Count - 1; i >= 0; i--)
+            {
+                DynamicRunningCoroutine running = _dynamicRunningCoroutines[i];
+                if (running == null || running.Instance == null)
+                {
+                    _dynamicRunningCoroutines.RemoveAt(i);
+                    continue;
+                }
+
+                if (ReferenceEquals(running.Instance, instance) &&
+                    string.Equals(running.MethodName, methodName, StringComparison.Ordinal))
+                {
+                    if (running.Handle != null)
+                    {
+                        instance.StopCoroutine(running.Handle);
+                    }
+                    _dynamicRunningCoroutines.RemoveAt(i);
+                }
             }
         }
 
@@ -1555,14 +2044,18 @@ namespace Nyks.HotReload.Editor.Core
                 return string.Empty;
             }
 
+            string filePrefix = !string.IsNullOrEmpty(d.FilePath)
+                ? $"<b>[{Path.GetFileName(d.FilePath)}]</b> "
+                : string.Empty;
+
             if (!turkish)
             {
-                return d.ToString();
+                return filePrefix + d.ToString();
             }
 
             string loc = d.Line > 0 ? $"(Satır {d.Line}, Sütun {d.Column}) " : string.Empty;
             string translated = TranslateCompilerErrorToTurkish(d.Id, d.Message);
-            return $"{loc}<b>{d.Id}</b>: {translated}";
+            return $"{filePrefix}{loc}<b>{d.Id}</b>: {translated}";
         }
 
         private static string TranslateCompilerErrorToTurkish(string id, string msg)

@@ -24,6 +24,7 @@ namespace Nyks.HotReload.Editor.Core
     {
         public string Id { get; set; }
         public string Message { get; set; }
+        public string FilePath { get; set; }
         public int Line { get; set; }
         public int Column { get; set; }
         public bool IsError { get; set; }
@@ -83,61 +84,169 @@ namespace Nyks.HotReload.Editor.Core
         private static string _cachedDotNetExePath;
         private static string _cachedCscDllPath;
 
+        private static bool _compilationContextCached;
+        private static List<string> _cachedBaseReferences;
+        private static List<string> _cachedProjectAssemblyNames;
+        private static HashSet<string> _cachedBaseDefines;
+        private static Dictionary<string, string[]> _cachedScriptDefinesByPath;
+
         /// <summary>
         /// Compiles the specified C# script file into an in-memory dynamic assembly.
         /// </summary>
         public static HotReloadCompileResult CompileScriptFile(string scriptFilePath)
         {
+            if (string.IsNullOrEmpty(scriptFilePath))
+            {
+                var emptyRes = new HotReloadCompileResult();
+                emptyRes.Diagnostics.Add(new CompilerDiagnosticEntry
+                {
+                    Id = "HR0001",
+                    Message = "Script file path is empty.",
+                    IsError = true
+                });
+                return emptyRes;
+            }
+
+            return CompileScriptBatch(new[] { scriptFilePath });
+        }
+
+        /// <summary>
+        /// Compiles one or more modified C# script files together into a single in-memory dynamic assembly.
+        /// Compiling multiple modified files in one batch prevents sequential multi-second compiles and resolves
+        /// cross-file dependencies (e.g. a new public method added in Script A and called in Script B).
+        /// </summary>
+        public static HotReloadCompileResult CompileScriptBatch(IReadOnlyList<string> scriptFilePaths)
+        {
             var stopwatch = Stopwatch.StartNew();
             var result = new HotReloadCompileResult();
 
-            if (string.IsNullOrEmpty(scriptFilePath) || !File.Exists(scriptFilePath))
+            if (scriptFilePaths == null || scriptFilePaths.Count == 0)
             {
                 result.Diagnostics.Add(new CompilerDiagnosticEntry
                 {
                     Id = "HR0001",
-                    Message = $"Script file not found: {scriptFilePath}",
+                    Message = "No script files provided for compilation.",
                     IsError = true
                 });
                 return result;
             }
 
-            string rawSource;
-            try
-            {
-                rawSource = ReadFileWithRetry(scriptFilePath);
-            }
-            catch (Exception ex)
-            {
-                result.Diagnostics.Add(new CompilerDiagnosticEntry
-                {
-                    Id = "HR0002",
-                    Message = $"Failed to read script file: {ex.Message}",
-                    IsError = true
-                });
-                return result;
-            }
-
+            string primaryScriptPath = scriptFilePaths[0];
             CollectCompilationContext(
-                scriptFilePath,
+                primaryScriptPath,
                 out List<string> referencePaths,
                 out List<string> defineSymbols,
                 out List<string> projectAssemblyNames);
 
-            SourceRewriteResult rewriteResult = HotReloadSourceRewriter.Rewrite(
-                rawSource,
-                projectAssemblyNames,
-                ResolveLoadedTypeByName);
+            var combinedRewrite = new SourceRewriteResult();
+            var filePathsList = new List<string>(scriptFilePaths.Count);
+            var rewrittenSourcesList = new List<string>(scriptFilePaths.Count);
 
-            result.RewriteInfo = rewriteResult;
+            for (int i = 0; i < scriptFilePaths.Count; i++)
+            {
+                string scriptFilePath = scriptFilePaths[i];
+                if (string.IsNullOrEmpty(scriptFilePath) || !File.Exists(scriptFilePath))
+                {
+                    continue;
+                }
+
+                string rawSource;
+                try
+                {
+                    rawSource = ReadFileWithRetry(scriptFilePath);
+                }
+                catch (Exception ex)
+                {
+                    result.Diagnostics.Add(new CompilerDiagnosticEntry
+                    {
+                        Id = "HR0002",
+                        FilePath = scriptFilePath,
+                        Message = $"Failed to read script file: {ex.Message}",
+                        IsError = true
+                    });
+                    return result;
+                }
+
+                bool emitBoilerplate = rewrittenSourcesList.Count == 0;
+                SourceRewriteResult singleRewrite = HotReloadSourceRewriter.Rewrite(
+                    rawSource,
+                    projectAssemblyNames,
+                    ResolveLoadedTypeByName,
+                    emitSharedAssemblyBoilerplate: emitBoilerplate);
+
+                filePathsList.Add(scriptFilePath);
+                rewrittenSourcesList.Add(singleRewrite.RewrittenSource);
+
+                if (rewrittenSourcesList.Count == 1)
+                {
+                    combinedRewrite.RewrittenSource = singleRewrite.RewrittenSource;
+                }
+
+                foreach (var addedField in singleRewrite.AddedFields)
+                {
+                    combinedRewrite.AddedFields.Add(addedField);
+                }
+                foreach (string declType in singleRewrite.DeclaredTypeNames)
+                {
+                    if (!combinedRewrite.DeclaredTypeNames.Contains(declType))
+                    {
+                        combinedRewrite.DeclaredTypeNames.Add(declType);
+                    }
+                }
+            }
+
+            if (rewrittenSourcesList.Count == 0)
+            {
+                result.Diagnostics.Add(new CompilerDiagnosticEntry
+                {
+                    Id = "HR0001",
+                    Message = "Script file not found on disk.",
+                    IsError = true
+                });
+                return result;
+            }
+
+            result.RewriteInfo = combinedRewrite;
 
             string patchAssemblyName = $"NyksHotReload_Patch_{_patchSequenceId++}_{Guid.NewGuid().ToString("N").Substring(0, 6)}";
 
-            // Tier 1: Unity DotNetSdk Roslyn (csc.dll) out-of-process compiler.
-            // Zero memory footprint in the Unity Editor AppDomain, no AssemblyResolve hooks, and full C# 10/11/12+ support.
+            // Tier 1: Fast Warm In-Memory Roslyn (~40-100ms) with cached MetadataReferences.
+            if (TryCompileInMemoryRoslyn(
+                patchAssemblyName,
+                filePathsList,
+                rewrittenSourcesList,
+                referencePaths,
+                defineSymbols,
+                out System.Reflection.Assembly inMemAssembly,
+                out List<CompilerDiagnosticEntry> inMemDiagnostics,
+                out bool shouldFallbackToDotNetSdk))
+            {
+                stopwatch.Stop();
+                result.Success = true;
+                result.CompiledAssembly = inMemAssembly;
+                result.EngineUsed = "In-Memory Roslyn";
+                result.CompileTimeMs = stopwatch.Elapsed.TotalMilliseconds;
+                result.Diagnostics.AddRange(inMemDiagnostics);
+                return result;
+            }
+
+            // If In-Memory Roslyn reported a clean user syntax error (and not a compiler/language-version limitation),
+            // return the error immediately in ~50ms without spawning an external process!
+            if (_roslynAvailable && !shouldFallbackToDotNetSdk && inMemDiagnostics != null && inMemDiagnostics.Count > 0)
+            {
+                stopwatch.Stop();
+                result.Success = false;
+                result.EngineUsed = "In-Memory Roslyn";
+                result.CompileTimeMs = stopwatch.Elapsed.TotalMilliseconds;
+                result.Diagnostics.AddRange(inMemDiagnostics);
+                return result;
+            }
+
+            // Tier 2: Unity DotNetSdk Roslyn (csc.dll) out-of-process compiler for C# 10/11/12+ syntax or fallback.
             if (TryCompileDotNetSdkCsc(
                 patchAssemblyName,
-                rewriteResult.RewrittenSource,
+                filePathsList,
+                rewrittenSourcesList,
                 referencePaths,
                 defineSymbols,
                 out System.Reflection.Assembly cscAssembly,
@@ -149,27 +258,6 @@ namespace Nyks.HotReload.Editor.Core
                 result.EngineUsed = "Unity DotNetSdk Roslyn (csc)";
                 result.CompileTimeMs = stopwatch.Elapsed.TotalMilliseconds;
                 result.Diagnostics.AddRange(cscDiagnostics);
-                return result;
-            }
-
-            // Tier 2 Fallback: Legacy In-Memory Roslyn only if DotNetSdk csc.dll is unavailable on this Unity installation
-            List<CompilerDiagnosticEntry> inMemDiagnostics = null;
-            if (!ResolveDotNetAndCscPaths(out _, out _) &&
-                TryCompileInMemoryRoslyn(
-                    patchAssemblyName,
-                    scriptFilePath,
-                    rewriteResult.RewrittenSource,
-                    referencePaths,
-                    defineSymbols,
-                    out System.Reflection.Assembly inMemAssembly,
-                    out inMemDiagnostics))
-            {
-                stopwatch.Stop();
-                result.Success = true;
-                result.CompiledAssembly = inMemAssembly;
-                result.EngineUsed = "In-Memory Roslyn";
-                result.CompileTimeMs = stopwatch.Elapsed.TotalMilliseconds;
-                result.Diagnostics.AddRange(inMemDiagnostics);
                 return result;
             }
 
@@ -198,13 +286,19 @@ namespace Nyks.HotReload.Editor.Core
         }
 
         /// <summary>
-        /// Pre-resolves the bundled DotNetSdk compiler paths without loading any assemblies into the Unity Editor AppDomain.
+        /// Pre-resolves the compiler paths and caches assembly references so the first Hot Reload is instantaneous.
         /// </summary>
         public static void WarmUp()
         {
             try
             {
                 ResolveDotNetAndCscPaths(out _, out _);
+                EnsureInMemoryRoslynLoaded();
+                CollectCompilationContext(null, out List<string> refs, out _, out _);
+                if (_roslynAvailable && refs != null && refs.Count > 0)
+                {
+                    GetOrCreateMetadataReferences(refs);
+                }
             }
             catch
             {
@@ -214,15 +308,17 @@ namespace Nyks.HotReload.Editor.Core
 
         private static bool TryCompileInMemoryRoslyn(
             string assemblyName,
-            string filePath,
-            string rewrittenSource,
+            IReadOnlyList<string> filePaths,
+            IReadOnlyList<string> rewrittenSources,
             List<string> referencePaths,
             List<string> defineSymbols,
             out System.Reflection.Assembly compiledAssembly,
-            out List<CompilerDiagnosticEntry> diagnostics)
+            out List<CompilerDiagnosticEntry> diagnostics,
+            out bool shouldFallbackToDotNetSdk)
         {
             compiledAssembly = null;
             diagnostics = new List<CompilerDiagnosticEntry>();
+            shouldFallbackToDotNetSdk = true;
 
             EnsureInMemoryRoslynLoaded();
             if (!_roslynAvailable)
@@ -274,7 +370,7 @@ namespace Nyks.HotReload.Editor.Core
                     return false;
                 }
 
-                // 2. Parse SyntaxTree
+                // 2. Parse SyntaxTrees for all files in the batch
                 MethodInfo parseTextMethod = null;
                 foreach (MethodInfo m in _csharpSyntaxTreeType.GetMethods(BindingFlags.Public | BindingFlags.Static))
                 {
@@ -295,19 +391,23 @@ namespace Nyks.HotReload.Editor.Core
                 }
 
                 ParameterInfo[] parseParams = parseTextMethod.GetParameters();
-                object[] parseArgs = new object[parseParams.Length];
-                parseArgs[0] = rewrittenSource;
-                parseArgs[1] = parseOptions;
-                parseArgs[2] = filePath ?? string.Empty;
-                parseArgs[3] = Encoding.UTF8;
-                for (int i = 4; i < parseParams.Length; i++)
-                {
-                    parseArgs[i] = parseParams[i].DefaultValue;
-                }
+                Array syntaxTreeArray = Array.CreateInstance(_syntaxTreeType, rewrittenSources.Count);
 
-                object syntaxTree = parseTextMethod.Invoke(null, parseArgs);
-                Array syntaxTreeArray = Array.CreateInstance(_syntaxTreeType, 1);
-                syntaxTreeArray.SetValue(syntaxTree, 0);
+                for (int s = 0; s < rewrittenSources.Count; s++)
+                {
+                    object[] parseArgs = new object[parseParams.Length];
+                    parseArgs[0] = rewrittenSources[s];
+                    parseArgs[1] = parseOptions;
+                    parseArgs[2] = (filePaths != null && s < filePaths.Count && filePaths[s] != null) ? filePaths[s] : string.Empty;
+                    parseArgs[3] = Encoding.UTF8;
+                    for (int i = 4; i < parseParams.Length; i++)
+                    {
+                        parseArgs[i] = parseParams[i].DefaultValue;
+                    }
+
+                    object syntaxTree = parseTextMethod.Invoke(null, parseArgs);
+                    syntaxTreeArray.SetValue(syntaxTree, s);
+                }
 
                 // 3. Build CSharpCompilationOptions (OutputKind.DynamicallyLinkedLibrary = 2, AllowUnsafe = true)
                 object outputKindDll = Enum.ToObject(_outputKindType, 2);
@@ -436,6 +536,7 @@ namespace Nyks.HotReload.Editor.Core
 
                     bool isSuccess = (bool)successProp.GetValue(emitResult);
                     IEnumerable rawDiags = diagProp.GetValue(emitResult) as IEnumerable;
+                    shouldFallbackToDotNetSdk = false;
 
                     if (rawDiags != null)
                     {
@@ -456,11 +557,18 @@ namespace Nyks.HotReload.Editor.Core
                             }
 
                             bool isErr = severityInt == 3; // Error = 3
+                            if (isErr && (id == "CS8703" || id == "CS8652" || id == "CS8400" || id == "CS8773" || id == "CS8936" || id == "CS0518"))
+                            {
+                                // Language version / C# 10+ syntax feature not supported by Mono's Roslyn 3.7: fall back to DotNetSdk Roslyn
+                                shouldFallbackToDotNetSdk = true;
+                            }
+
                             MethodInfo getMessage = dType.GetMethod("GetMessage", new[] { typeof(IFormatProvider) });
                             string msg = getMessage != null ? (string)getMessage.Invoke(d, new object[] { null }) : d.ToString();
 
                             int line = 0;
                             int col = 0;
+                            string diagFilePath = null;
                             object location = dType.GetProperty("Location")?.GetValue(d);
                             if (location != null)
                             {
@@ -468,6 +576,7 @@ namespace Nyks.HotReload.Editor.Core
                                 if (getLineSpan != null)
                                 {
                                     object lineSpan = getLineSpan.Invoke(location, null);
+                                    diagFilePath = lineSpan.GetType().GetProperty("Path")?.GetValue(lineSpan) as string;
                                     object startPos = lineSpan.GetType().GetProperty("StartLinePosition")?.GetValue(lineSpan);
                                     if (startPos != null)
                                     {
@@ -481,6 +590,7 @@ namespace Nyks.HotReload.Editor.Core
                             {
                                 Id = id,
                                 Message = msg,
+                                FilePath = diagFilePath,
                                 Line = line,
                                 Column = col,
                                 IsError = isErr
@@ -490,6 +600,10 @@ namespace Nyks.HotReload.Editor.Core
 
                     if (!isSuccess)
                     {
+                        if (diagnostics.Count == 0)
+                        {
+                            shouldFallbackToDotNetSdk = true;
+                        }
                         return false;
                     }
 
@@ -500,13 +614,15 @@ namespace Nyks.HotReload.Editor.Core
             }
             catch
             {
+                shouldFallbackToDotNetSdk = true;
                 return false;
             }
         }
 
         private static bool TryCompileDotNetSdkCsc(
             string assemblyName,
-            string rewrittenSource,
+            IReadOnlyList<string> originalFilePaths,
+            IReadOnlyList<string> rewrittenSources,
             List<string> referencePaths,
             List<string> defineSymbols,
             out System.Reflection.Assembly compiledAssembly,
@@ -529,13 +645,26 @@ namespace Nyks.HotReload.Editor.Core
             string tempDir = Path.Combine(Path.GetTempPath(), "NyksHotReload");
             Directory.CreateDirectory(tempDir);
 
-            string srcFile = Path.Combine(tempDir, $"{assemblyName}.cs");
+            var tempSrcFiles = new List<string>(rewrittenSources.Count);
+            var tempToOriginalMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             string rspFile = Path.Combine(tempDir, $"{assemblyName}.rsp");
             string outDll = Path.Combine(tempDir, $"{assemblyName}.dll");
 
             try
             {
-                File.WriteAllText(srcFile, rewrittenSource, Encoding.UTF8);
+                for (int i = 0; i < rewrittenSources.Count; i++)
+                {
+                    string origName = (originalFilePaths != null && i < originalFilePaths.Count && !string.IsNullOrEmpty(originalFilePaths[i]))
+                        ? Path.GetFileNameWithoutExtension(originalFilePaths[i])
+                        : $"Script_{i}";
+                    string tempSrc = Path.Combine(tempDir, $"{assemblyName}_{i}_{origName}.cs");
+                    File.WriteAllText(tempSrc, rewrittenSources[i], Encoding.UTF8);
+                    tempSrcFiles.Add(tempSrc);
+                    if (originalFilePaths != null && i < originalFilePaths.Count && !string.IsNullOrEmpty(originalFilePaths[i]))
+                    {
+                        tempToOriginalMap[Path.GetFileName(tempSrc)] = originalFilePaths[i];
+                    }
+                }
 
                 var rsp = new StringBuilder(16384);
                 rsp.AppendLine("-target:library");
@@ -565,7 +694,10 @@ namespace Nyks.HotReload.Editor.Core
                     }
                 }
 
-                rsp.AppendLine($"\"{srcFile}\"");
+                for (int i = 0; i < tempSrcFiles.Count; i++)
+                {
+                    rsp.AppendLine($"\"{tempSrcFiles[i]}\"");
+                }
                 File.WriteAllText(rspFile, rsp.ToString(), Encoding.UTF8);
 
                 var psi = new ProcessStartInfo
@@ -586,7 +718,7 @@ namespace Nyks.HotReload.Editor.Core
                     string stderr = proc.StandardError.ReadToEnd();
                     proc.WaitForExit(10000);
 
-                    ParseCscOutput(stdout + "\n" + stderr, diagnostics);
+                    ParseCscOutput(stdout + "\n" + stderr, diagnostics, tempToOriginalMap);
 
                     if (proc.ExitCode != 0 || !File.Exists(outDll))
                     {
@@ -611,7 +743,10 @@ namespace Nyks.HotReload.Editor.Core
             }
             finally
             {
-                TryDeleteFile(srcFile);
+                for (int i = 0; i < tempSrcFiles.Count; i++)
+                {
+                    TryDeleteFile(tempSrcFiles[i]);
+                }
                 TryDeleteFile(rspFile);
                 TryDeleteFile(outDll);
             }
@@ -762,177 +897,191 @@ namespace Nyks.HotReload.Editor.Core
             out List<string> defineSymbols,
             out List<string> projectAssemblyNames)
         {
-            referencePaths = new List<string>(128);
-            defineSymbols = new List<string>(64);
-            projectAssemblyNames = new List<string>(32);
-
-            var definesSet = new HashSet<string>(StringComparer.Ordinal);
-            foreach (string def in EditorUserBuildSettings.activeScriptCompilationDefines)
+            if (!_compilationContextCached || _cachedBaseReferences == null || _cachedProjectAssemblyNames == null || _cachedBaseDefines == null)
             {
-                definesSet.Add(def);
-            }
-            definesSet.Add("UNITY_EDITOR");
-            definesSet.Add("DEBUG");
-            definesSet.Add("TRACE");
+                _cachedBaseReferences = new List<string>(128);
+                _cachedProjectAssemblyNames = new List<string>(32);
+                _cachedBaseDefines = new HashSet<string>(StringComparer.Ordinal);
+                _cachedScriptDefinesByPath = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
 
-            var pipelineRefCandidates = new List<string>(256);
-
-            // Check Unity CompilationPipeline for the owning assembly's exact defines & references
-            try
-            {
-                UnityEditor.Compilation.Assembly[] unityAssemblies = CompilationPipeline.GetAssemblies();
-                string normalizedScript = !string.IsNullOrEmpty(scriptFilePath)
-                    ? Path.GetFullPath(scriptFilePath).Replace('\\', '/')
-                    : null;
-
-                foreach (UnityEditor.Compilation.Assembly uAsm in unityAssemblies)
+                foreach (string def in EditorUserBuildSettings.activeScriptCompilationDefines)
                 {
-                    if (!string.IsNullOrEmpty(uAsm.name))
-                    {
-                        projectAssemblyNames.Add(uAsm.name);
-                    }
+                    _cachedBaseDefines.Add(def);
+                }
+                _cachedBaseDefines.Add("UNITY_EDITOR");
+                _cachedBaseDefines.Add("DEBUG");
+                _cachedBaseDefines.Add("TRACE");
 
-                    if (!string.IsNullOrEmpty(uAsm.outputPath))
-                    {
-                        pipelineRefCandidates.Add(uAsm.outputPath);
-                    }
+                var pipelineRefCandidates = new List<string>(256);
 
-                    if (uAsm.compiledAssemblyReferences != null)
+                try
+                {
+                    UnityEditor.Compilation.Assembly[] unityAssemblies = CompilationPipeline.GetAssemblies();
+                    foreach (UnityEditor.Compilation.Assembly uAsm in unityAssemblies)
                     {
-                        foreach (string compRef in uAsm.compiledAssemblyReferences)
+                        if (!string.IsNullOrEmpty(uAsm.name) && !_cachedProjectAssemblyNames.Contains(uAsm.name))
                         {
-                            if (!string.IsNullOrEmpty(compRef))
-                            {
-                                pipelineRefCandidates.Add(compRef);
-                            }
+                            _cachedProjectAssemblyNames.Add(uAsm.name);
                         }
-                    }
 
-                    if (normalizedScript != null && uAsm.sourceFiles != null)
-                    {
-                        foreach (string src in uAsm.sourceFiles)
+                        if (!string.IsNullOrEmpty(uAsm.outputPath))
                         {
-                            string fullSrc = Path.GetFullPath(src).Replace('\\', '/');
-                            if (string.Equals(fullSrc, normalizedScript, StringComparison.OrdinalIgnoreCase))
+                            pipelineRefCandidates.Add(uAsm.outputPath);
+                        }
+
+                        if (uAsm.compiledAssemblyReferences != null)
+                        {
+                            foreach (string compRef in uAsm.compiledAssemblyReferences)
                             {
-                                if (uAsm.defines != null)
+                                if (!string.IsNullOrEmpty(compRef))
                                 {
-                                    foreach (string d in uAsm.defines)
-                                    {
-                                        definesSet.Add(d);
-                                    }
+                                    pipelineRefCandidates.Add(compRef);
                                 }
-                                break;
+                            }
+                        }
+
+                        if (uAsm.sourceFiles != null && uAsm.defines != null && uAsm.defines.Length > 0)
+                        {
+                            foreach (string src in uAsm.sourceFiles)
+                            {
+                                if (!string.IsNullOrEmpty(src))
+                                {
+                                    string fullSrc = Path.GetFullPath(src).Replace('\\', '/');
+                                    _cachedScriptDefinesByPath[fullSrc] = uAsm.defines;
+                                }
                             }
                         }
                     }
                 }
-            }
-            catch
-            {
-                // Ignore if CompilationPipeline is unavailable
-            }
-
-            if (!projectAssemblyNames.Contains("Assembly-CSharp"))
-            {
-                projectAssemblyNames.Add("Assembly-CSharp");
-            }
-
-            defineSymbols.AddRange(definesSet);
-
-            // Collect loaded AppDomain assemblies, CompilationPipeline references, and plugin DLLs, deduplicating by file name
-            var seenFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var seenFullPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var collectedRefs = referencePaths;
-
-            void TryAddReferencePath(string candidatePath)
-            {
-                if (string.IsNullOrEmpty(candidatePath) || !File.Exists(candidatePath))
+                catch
                 {
-                    return;
+                    // Ignore if CompilationPipeline is unavailable
                 }
 
-                string full = Path.GetFullPath(candidatePath);
-                string fileName = Path.GetFileName(full);
-
-                if (fileName.StartsWith("NyksHotReload_Patch_", StringComparison.OrdinalIgnoreCase) ||
-                    fileName.StartsWith("Microsoft.CodeAnalysis", StringComparison.OrdinalIgnoreCase) ||
-                    full.IndexOf("NetStandard\\ref\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    full.IndexOf("NetStandard/ref/", StringComparison.OrdinalIgnoreCase) >= 0)
+                if (!_cachedProjectAssemblyNames.Contains("Assembly-CSharp"))
                 {
-                    return;
+                    _cachedProjectAssemblyNames.Add("Assembly-CSharp");
                 }
 
-                if (seenFileNames.Contains(fileName) || seenFullPaths.Contains(full))
+                var seenFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var seenFullPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                void TryAddReferencePath(string candidatePath)
                 {
-                    return;
+                    if (string.IsNullOrEmpty(candidatePath) || !File.Exists(candidatePath))
+                    {
+                        return;
+                    }
+
+                    string full = Path.GetFullPath(candidatePath);
+                    string fileName = Path.GetFileName(full);
+
+                    if (fileName.StartsWith("NyksHotReload_Patch_", StringComparison.OrdinalIgnoreCase) ||
+                        fileName.StartsWith("Microsoft.CodeAnalysis", StringComparison.OrdinalIgnoreCase) ||
+                        full.IndexOf("NetStandard\\ref\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        full.IndexOf("NetStandard/ref/", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        return;
+                    }
+
+                    if (seenFileNames.Contains(fileName) || seenFullPaths.Contains(full))
+                    {
+                        return;
+                    }
+
+                    seenFileNames.Add(fileName);
+                    seenFullPaths.Add(full);
+                    _cachedBaseReferences.Add(full);
                 }
 
-                seenFileNames.Add(fileName);
-                seenFullPaths.Add(full);
-                collectedRefs.Add(full);
-            }
-
-            foreach (System.Reflection.Assembly loadedAsm in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                if (loadedAsm == null || loadedAsm.IsDynamic)
+                foreach (System.Reflection.Assembly loadedAsm in AppDomain.CurrentDomain.GetAssemblies())
                 {
-                    continue;
+                    if (loadedAsm == null || loadedAsm.IsDynamic)
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        TryAddReferencePath(loadedAsm.Location);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+                }
+
+                foreach (string pipeRef in pipelineRefCandidates)
+                {
+                    try
+                    {
+                        TryAddReferencePath(pipeRef);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
                 }
 
                 try
                 {
-                    TryAddReferencePath(loadedAsm.Location);
+                    string scriptAssembliesDir = Path.GetFullPath("Library/ScriptAssemblies");
+                    if (Directory.Exists(scriptAssembliesDir))
+                    {
+                        foreach (string dllPath in Directory.GetFiles(scriptAssembliesDir, "*.dll"))
+                        {
+                            TryAddReferencePath(dllPath);
+                        }
+                    }
                 }
                 catch
                 {
-                    continue;
+                    // Ignore if Library/ScriptAssemblies is inaccessible
                 }
+
+                try
+                {
+                    string assetsPath = UnityEngine.Application.dataPath;
+                    if (!string.IsNullOrEmpty(assetsPath) && Directory.Exists(assetsPath))
+                    {
+                        foreach (string pluginDll in Directory.GetFiles(assetsPath, "*.dll", SearchOption.AllDirectories))
+                        {
+                            TryAddReferencePath(pluginDll);
+                        }
+                    }
+                }
+                catch
+                {
+                    // Ignore if plugin DLL enumeration fails
+                }
+
+                _compilationContextCached = true;
             }
 
-            foreach (string pipeRef in pipelineRefCandidates)
+            referencePaths = _cachedBaseReferences;
+            projectAssemblyNames = _cachedProjectAssemblyNames;
+
+            var definesSet = new HashSet<string>(_cachedBaseDefines, StringComparer.Ordinal);
+            if (!string.IsNullOrEmpty(scriptFilePath) && _cachedScriptDefinesByPath != null)
             {
                 try
                 {
-                    TryAddReferencePath(pipeRef);
+                    string normalizedScript = Path.GetFullPath(scriptFilePath).Replace('\\', '/');
+                    if (_cachedScriptDefinesByPath.TryGetValue(normalizedScript, out string[] asmDefines) && asmDefines != null)
+                    {
+                        for (int i = 0; i < asmDefines.Length; i++)
+                        {
+                            definesSet.Add(asmDefines[i]);
+                        }
+                    }
                 }
                 catch
                 {
-                    continue;
+                    // Ignore path normalization errors
                 }
             }
 
-            try
-            {
-                string scriptAssembliesDir = Path.GetFullPath("Library/ScriptAssemblies");
-                if (Directory.Exists(scriptAssembliesDir))
-                {
-                    foreach (string dllPath in Directory.GetFiles(scriptAssembliesDir, "*.dll"))
-                    {
-                        TryAddReferencePath(dllPath);
-                    }
-                }
-            }
-            catch
-            {
-                // Ignore if Library/ScriptAssemblies is inaccessible
-            }
-
-            try
-            {
-                string assetsPath = UnityEngine.Application.dataPath;
-                if (!string.IsNullOrEmpty(assetsPath) && Directory.Exists(assetsPath))
-                {
-                    foreach (string pluginDll in Directory.GetFiles(assetsPath, "*.dll", SearchOption.AllDirectories))
-                    {
-                        TryAddReferencePath(pluginDll);
-                    }
-                }
-            }
-            catch
-            {
-                // Ignore if plugin DLL enumeration fails
-            }
+            defineSymbols = new List<string>(definesSet);
         }
 
         private static bool ResolveDotNetAndCscPaths(out string dotnetExePath, out string cscDllPath)
@@ -1000,7 +1149,10 @@ namespace Nyks.HotReload.Editor.Core
             return false;
         }
 
-        private static void ParseCscOutput(string output, List<CompilerDiagnosticEntry> diagnostics)
+        private static void ParseCscOutput(
+            string output,
+            List<CompilerDiagnosticEntry> diagnostics,
+            Dictionary<string, string> tempToOriginalMap = null)
         {
             if (string.IsNullOrWhiteSpace(output))
             {
@@ -1026,10 +1178,26 @@ namespace Nyks.HotReload.Editor.Core
 
                 int lineNum = 0;
                 int colNum = 0;
+                string diagFilePath = null;
                 int parenOpen = line.IndexOf('(');
                 int parenClose = line.IndexOf(')', parenOpen + 1);
                 if (parenOpen > 0 && parenClose > parenOpen)
                 {
+                    string filePrefix = line.Substring(0, parenOpen).Trim();
+                    if (!string.IsNullOrEmpty(filePrefix))
+                    {
+                        string tempFileName = Path.GetFileName(filePrefix);
+                        if (tempToOriginalMap != null && !string.IsNullOrEmpty(tempFileName) &&
+                            tempToOriginalMap.TryGetValue(tempFileName, out string mappedPath))
+                        {
+                            diagFilePath = mappedPath;
+                        }
+                        else
+                        {
+                            diagFilePath = filePrefix;
+                        }
+                    }
+
                     string coords = line.Substring(parenOpen + 1, parenClose - parenOpen - 1);
                     string[] parts = coords.Split(',');
                     if (parts.Length >= 1) int.TryParse(parts[0], out lineNum);
@@ -1045,6 +1213,7 @@ namespace Nyks.HotReload.Editor.Core
                 {
                     Id = isError ? "ERROR" : "WARN",
                     Message = messagePart,
+                    FilePath = diagFilePath,
                     Line = lineNum,
                     Column = colNum,
                     IsError = isError
