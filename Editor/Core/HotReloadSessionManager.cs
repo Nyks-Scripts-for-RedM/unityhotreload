@@ -2007,13 +2007,19 @@ namespace Nyks.HotReload.Editor.Core
             else
             {
                 var errSb = new System.Text.StringBuilder();
+                bool allInfra = evt.Diagnostics.Count > 0 &&
+                                evt.Diagnostics.TrueForAll(d => !d.IsError || HotReloadCompilerService.IsInfrastructureDiagnostic(d.Id));
                 if (tr)
                 {
-                    errSb.AppendLine($"<color=#F87171><b>[📝 Kod Hatası • {evt.ScriptName}]</b></color> <i>(Eklenti hatası değildir — yazdığın C# kodunda hata var)</i>:");
+                    errSb.AppendLine(allInfra
+                        ? $"<color=#F87171><b>[⚙️ Hot Reload Derleyici Hatası • {evt.ScriptName}]</b></color> <i>(Senin kodunla ilgili değil — eklenti altyapı hatası. Unity'nin normal derlemesi etkilenmez.)</i>:"
+                        : $"<color=#F87171><b>[📝 Kod Hatası • {evt.ScriptName}]</b></color> <i>(Eklenti hatası değildir — yazdığın C# kodunda hata var)</i>:");
                 }
                 else
                 {
-                    errSb.AppendLine($"<color=#F87171><b>[📝 C# Script Error • {evt.ScriptName}]</b></color> <i>(Code error in your C# script, not a plugin error)</i>:");
+                    errSb.AppendLine(allInfra
+                        ? $"<color=#F87171><b>[⚙️ Hot Reload Compiler Error • {evt.ScriptName}]</b></color> <i>(Plugin infrastructure error, not caused by your C# script. Normal Unity compilation is unaffected.)</i>:"
+                        : $"<color=#F87171><b>[📝 C# Script Error • {evt.ScriptName}]</b></color> <i>(Code error in your C# script, not a plugin error)</i>:");
                 }
 
                 foreach (CompilerDiagnosticEntry d in evt.Diagnostics)

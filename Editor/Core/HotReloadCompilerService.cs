@@ -90,6 +90,25 @@ namespace Nyks.HotReload.Editor.Core
         private static HashSet<string> _cachedBaseDefines;
         private static Dictionary<string, string[]> _cachedScriptDefinesByPath;
 
+        // Compiler-infrastructure diagnostics: never caused by user code. Trigger Tier 2 fallback instead of reporting.
+        private static readonly HashSet<string> _infrastructureDiagnosticIds = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "CS0041", // Unexpected error writing debug information
+            "CS0016", // Could not write to output file
+            "CS7038", // Failed to emit module
+            "CS0009", // Metadata file could not be opened
+            "CS0006", // Metadata file could not be found
+        };
+
+        internal static bool IsInfrastructureDiagnostic(string id)
+        {
+            if (string.IsNullOrEmpty(id))
+            {
+                return false;
+            }
+            return _infrastructureDiagnosticIds.Contains(id) || id.StartsWith("HR", StringComparison.Ordinal);
+        }
+
         /// <summary>
         /// Compiles the specified C# script file into an in-memory dynamic assembly.
         /// </summary>
@@ -496,9 +515,11 @@ namespace Nyks.HotReload.Editor.Core
                     null,
                     new object[] { assemblyName, syntaxTreeArray, metadataRefsArray, compilationOptions });
 
-                // 6. Emit to MemoryStream
+                // 6. Emit to MemoryStream.
+                // pdbStream is intentionally null: with EmitOptions=null Roslyn defaults to native Windows PDB,
+                // which requires COM DiaSymReader and throws PlatformNotSupportedException on Unity's Mono (CS0041).
+                // PDB bytes are not loaded anyway (Assembly.Load(peBytes) only).
                 using (var peStream = new MemoryStream(65536))
-                using (var pdbStream = new MemoryStream(32768))
                 {
                     MethodInfo emitMethod = null;
                     foreach (MethodInfo m in _csharpCompilationType.GetMethods(BindingFlags.Public | BindingFlags.Instance))
@@ -522,7 +543,7 @@ namespace Nyks.HotReload.Editor.Core
                     ParameterInfo[] emitParams = emitMethod.GetParameters();
                     object[] emitArgs = new object[emitParams.Length];
                     emitArgs[0] = peStream;
-                    emitArgs[1] = pdbStream;
+                    emitArgs[1] = null;
                     for (int i = 2; i < emitParams.Length; i++)
                     {
                         emitArgs[i] = emitParams[i].HasDefaultValue
@@ -557,6 +578,10 @@ namespace Nyks.HotReload.Editor.Core
                             }
 
                             bool isErr = severityInt == 3; // Error = 3
+                            if (isErr && _infrastructureDiagnosticIds.Contains(id))
+                            {
+                                shouldFallbackToDotNetSdk = true;
+                            }
                             if (isErr && (id == "CS8703" || id == "CS8652" || id == "CS8400" || id == "CS8773" || id == "CS8936" || id == "CS0518"))
                             {
                                 // Language version / C# 10+ syntax feature not supported by Mono's Roslyn 3.7: fall back to DotNetSdk Roslyn
@@ -1208,10 +1233,19 @@ namespace Nyks.HotReload.Editor.Core
                 if (colonIdx < 0) colonIdx = line.IndexOf(": warning ", StringComparison.Ordinal);
 
                 string messagePart = colonIdx >= 0 ? line.Substring(colonIdx + 2) : line;
+                // messagePart looks like "error CS1002: ; expected" → extract "CS1002"
+                string diagId = isError ? "ERROR" : "WARN";
+                int csIdx = messagePart.IndexOf("CS", StringComparison.Ordinal);
+                int idEnd = csIdx >= 0 ? messagePart.IndexOf(':', csIdx) : -1;
+                if (csIdx >= 0 && idEnd > csIdx)
+                {
+                    diagId = messagePart.Substring(csIdx, idEnd - csIdx).Trim();
+                    messagePart = messagePart.Substring(idEnd + 1).Trim();
+                }
 
                 diagnostics.Add(new CompilerDiagnosticEntry
                 {
-                    Id = isError ? "ERROR" : "WARN",
+                    Id = diagId,
                     Message = messagePart,
                     FilePath = diagFilePath,
                     Line = lineNum,

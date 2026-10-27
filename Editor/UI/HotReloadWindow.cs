@@ -309,9 +309,13 @@ namespace Nyks.HotReload.Editor.UI
                 EditorGUILayout.BeginVertical(EditorStyles.helpBox);
 
                 EditorGUILayout.BeginHorizontal();
-                string icon = !evt.Success ? "📝" : (evt.RequiresDomainReload ? "⚠️" : "✅");
+                bool allInfra = !evt.Success && evt.Diagnostics.Count > 0 &&
+                                evt.Diagnostics.TrueForAll(d => !d.IsError || HotReloadCompilerService.IsInfrastructureDiagnostic(d.Id));
+                string icon = !evt.Success ? (allInfra ? "⚙️" : "📝") : (evt.RequiresDomainReload ? "⚠️" : "✅");
                 string statusPrefix = !evt.Success
-                    ? (tr ? "[Kod Hatası] " : "[Script Error] ")
+                    ? (allInfra
+                        ? (tr ? "[Derleyici Hatası] " : "[Compiler Error] ")
+                        : (tr ? "[Kod Hatası] " : "[Script Error] "))
                     : string.Empty;
                 string header = $"{icon} [{evt.TimestampLocal:HH:mm:ss}]  {statusPrefix}{evt.ScriptName}  —  {evt.TotalTimeMs:F0} ms ({evt.CompilerEngine})";
 
@@ -354,7 +358,9 @@ namespace Nyks.HotReload.Editor.UI
                     if (evt.Diagnostics.Count > 0)
                     {
                         EditorGUILayout.LabelField(
-                            tr ? "Kod Hataları (Eklenti hatası değildir, yazdığın C# kodundaki hatalar):" : "Script Compiler Diagnostics:",
+                            allInfra
+                                ? (tr ? "Derleyici Altyapı Hataları (Senin kodunla ilgili değil):" : "Compiler Infrastructure Diagnostics:")
+                                : (tr ? "Kod Hataları (Eklenti hatası değildir, yazdığın C# kodundaki hatalar):" : "Script Compiler Diagnostics:"),
                             EditorStyles.miniBoldLabel);
                         foreach (CompilerDiagnosticEntry d in evt.Diagnostics)
                         {
