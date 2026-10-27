@@ -156,8 +156,8 @@ namespace Nyks.HotReload.Editor.UI
             string modeInfo = EditorApplication.isPlaying
                 ? (tr ? "Play Mode Aktif ⚡ (Domain Reload Kilitli 🔒)" : "Play Mode Active ⚡ (Domain Reload Locked 🔒)")
                 : (HotReloadSessionManager.AllowEditModePatching
-                    ? (tr ? "Edit Mode + Play Mode Aktif ⚡ (Donma Kilitli 🔒)" : "Edit Mode + Play Mode Active ⚡ (Domain Reload Locked 🔒)")
-                    : (tr ? "Sadece Play Mode (Play Mode Bekleniyor)" : "Play Mode Only (Waiting for Play Mode)"));
+                    ? (tr ? "Edit Mode + Play Mode Anında Yama Aktif ⚡ (~25ms)" : "Edit Mode + Play Mode Instant Patch Active ⚡ (~25ms)")
+                    : (tr ? "Edit Mode: Native Derleyici  •  Play Mode: Anında Yama ⚡" : "Edit Mode: Native Compiler  •  Play Mode: Instant Patch ⚡"));
 
             string subText = tr
                 ? $"{modeInfo}  •  Aktif Yama: {NativeMethodDetour.ActiveDetourCount}  •  Unity {Application.unityVersion}"
@@ -175,21 +175,21 @@ namespace Nyks.HotReload.Editor.UI
             HotReloadSessionManager.IsEnabled = EditorGUILayout.ToggleLeft(
                 new GUIContent(
                     tr ? "Hot Reload İzleyiciyi Etkinleştir" : "Enable Hot Reload Watcher",
-                    tr ? "Değişen .cs dosyalarını otomatik derler ve anında yamalar." : "Automatically compiles and patches modified .cs files."),
+                    tr ? "Play Mode sırasında değişen .cs dosyalarını otomatik derler ve anında yamalar." : "Automatically compiles and patches modified .cs files during Play Mode."),
                 HotReloadSessionManager.IsEnabled);
 
             HotReloadSessionManager.LockPlayModeAutoRefresh = EditorGUILayout.ToggleLeft(
                 new GUIContent(
-                    tr ? "Unity Donmasını / Domain Reload'u Kilitle" : "Lock Unity Domain Reload",
-                    tr ? "Unity'nin her kayıtta donmasını ve baştan derleme yapmasını engeller." : "Prevents Unity from freezing and performing a full Domain Reload."),
+                    tr ? "Play Mode Domain Reload'u Kilitle" : "Lock Play Mode Domain Reload",
+                    tr ? "Oyun çalışırken (Play Mode) Unity'nin donmasını ve baştan derleme yapmasını engeller." : "Prevents Unity from freezing and performing a full Domain Reload during Play Mode."),
                 HotReloadSessionManager.LockPlayModeAutoRefresh);
             EditorGUILayout.EndHorizontal();
 
             EditorGUILayout.BeginHorizontal();
             HotReloadSessionManager.AllowEditModePatching = EditorGUILayout.ToggleLeft(
                 new GUIContent(
-                    tr ? "Edit Mode (Oyun Dışı) Anında Yama" : "Allow Edit-Mode Hot Patching",
-                    tr ? "Oyun çalışmıyorken de (Edit Mode) kodları donmadan anında yamalar." : "Also hot-patches methods when saving scripts outside Play Mode."),
+                    tr ? "Edit Mode'da Anında Yama (~25ms)" : "Edit Mode Instant Hot-Patch (~25ms)",
+                    tr ? "Oyun çalışmıyorken (Edit Mode) de Domain Reload olmadan ~25ms içinde yamalar ve Play'e girerken yamaları korur." : "Hot-patches scripts in Edit Mode in ~25ms without Domain Reloads and preserves patches when entering Play Mode."),
                 HotReloadSessionManager.AllowEditModePatching);
 
             HotReloadSessionManager.ShowToastNotifications = EditorGUILayout.ToggleLeft(
@@ -197,6 +197,15 @@ namespace Nyks.HotReload.Editor.UI
                     tr ? "Sahne / Oyun Ekranı Bildirimi Göster" : "Show SceneView / GameView Toast",
                     tr ? "Kod güncellendiğinde sağ altta bildirim kutusu gösterir." : "Displays a floating notification badge whenever a script is hot-reloaded."),
                 HotReloadSessionManager.ShowToastNotifications);
+            EditorGUILayout.EndHorizontal();
+
+            EditorGUILayout.BeginHorizontal();
+            HotReloadSessionManager.SkipDomainReloadOnEnterPlayMode = EditorGUILayout.ToggleLeft(
+                new GUIContent(
+                    tr ? "Play'e Girerken Domain Reload Yapma (Hızlı Play ⚡)" : "Skip Domain Reload on Enter Play Mode (Fast Play ⚡)",
+                    tr ? "Project Settings > Editor > Enter Play Mode Settings = 'Reload Scene only'. Play'e basınca ~4sn'lik 'Reload Domain' beklemesi kalkar. Sahne yine sıfırlanır; sadece static değişkenler Play oturumları arasında sıfırlanmaz."
+                       : "Sets Enter Play Mode Settings to 'Reload Scene only'. Removes the ~4s 'Reload Domain' wait when pressing Play. Scenes still reset; only static fields persist between Play sessions."),
+                HotReloadSessionManager.SkipDomainReloadOnEnterPlayMode);
             EditorGUILayout.EndHorizontal();
 
             EditorGUILayout.Space(2f);
@@ -291,14 +300,14 @@ namespace Nyks.HotReload.Editor.UI
             {
                 EditorGUILayout.HelpBox(
                     tr
-                        ? "Hot Reload Pro hem Edit Mode hem Play Mode'da AKTİF!\n\n" +
-                          "1. IDE'nde herhangi bir C# scriptini aç (ör. PlayerController.cs).\n" +
-                          "2. Bir metodu değiştir veya yeni değişken ekle ve Ctrl+S yap.\n" +
-                          "3. Unity donmadan milisaniyeler içinde yamalandığını burada gör!"
-                        : "Hot Reload Pro is ACTIVE in both Edit Mode and Play Mode!\n\n" +
-                          "1. Open any C# script in your IDE (e.g. PlayerController.cs) right now (in Edit Mode OR Play Mode).\n" +
-                          "2. Modify any method or add a field and press Ctrl+S.\n" +
-                          "3. Watch it compile and patch here in milliseconds without freezing Unity!",
+                        ? "Hot Reload Pro HAZIR! (Edit Mode & Play Mode Aktif ⚡)\n\n" +
+                          "• Edit Mode (Oyun Dışı): Kodu değiştirip Ctrl+S yaptığında SourceAssetDB zaman damgası sabitlenir; QuickSearch çifte reload hatası olmadan ~25ms içinde yamalanır!\n" +
+                          "• Play'e Giriş (İlk Oyuna Giriş): Edit Mode yamaları Cross-Domain önbellekten ~1ms içinde Awake() öncesinde otomatik yüklenir (ekstra reload atmaz).\n" +
+                          "• Play Mode (Oyun İçi): Oyun sıfırlanmadan ~25ms içinde canlı yamalanır (Yeni Awake/Start/OnEnable/Update dahil)!"
+                        : "Hot Reload Pro is READY! (Edit Mode & Play Mode Active ⚡)\n\n" +
+                          "• Edit Mode: Saves are hot-patched in ~25ms with SourceAssetDB timestamp pinning (zero QuickSearch double reloads!).\n" +
+                          "• Entering Play Mode: Cached Edit Mode patches are restored in ~1ms before Awake() with zero extra reloads.\n" +
+                          "• Play Mode: Live gameplay hot-patches in ~25ms without resetting state (including newly added Awake/Start/OnEnable/Update)!",
                     MessageType.Info);
                 return;
             }

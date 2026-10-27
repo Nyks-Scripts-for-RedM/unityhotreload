@@ -44,6 +44,7 @@ namespace Nyks.HotReload.Editor.Core
     {
         public bool Success { get; set; }
         public System.Reflection.Assembly CompiledAssembly { get; set; }
+        public byte[] RawAssemblyBytes { get; set; }
         public string EngineUsed { get; set; }
         public double CompileTimeMs { get; set; }
         public List<CompilerDiagnosticEntry> Diagnostics { get; } = new List<CompilerDiagnosticEntry>();
@@ -58,8 +59,12 @@ namespace Nyks.HotReload.Editor.Core
     public static class HotReloadCompilerService
     {
         private static int _patchSequenceId = 1;
+        private static readonly object _roslynCompileLock = new object();
         private static bool _roslynInitialized;
         private static bool _roslynAvailable;
+        private static bool _roslynJitWarmedUp;
+        private static string _cachedEditorDataPath;
+        private static bool _isWindowsEditor = true;
 
         private static System.Reflection.Assembly _codeAnalysisAsm;
         private static System.Reflection.Assembly _codeAnalysisCSharpAsm;
@@ -134,7 +139,9 @@ namespace Nyks.HotReload.Editor.Core
         /// Compiling multiple modified files in one batch prevents sequential multi-second compiles and resolves
         /// cross-file dependencies (e.g. a new public method added in Script A and called in Script B).
         /// </summary>
-        public static HotReloadCompileResult CompileScriptBatch(IReadOnlyList<string> scriptFilePaths)
+        public static HotReloadCompileResult CompileScriptBatch(
+            IReadOnlyList<string> scriptFilePaths,
+            IReadOnlyList<string> companionScriptPaths = null)
         {
             var stopwatch = Stopwatch.StartNew();
             var result = new HotReloadCompileResult();
@@ -150,6 +157,12 @@ namespace Nyks.HotReload.Editor.Core
                 return result;
             }
 
+            if (string.IsNullOrEmpty(_cachedEditorDataPath))
+            {
+                _cachedEditorDataPath = EditorApplication.applicationContentsPath;
+                _isWindowsEditor = UnityEngine.Application.platform == UnityEngine.RuntimePlatform.WindowsEditor;
+            }
+
             string primaryScriptPath = scriptFilePaths[0];
             CollectCompilationContext(
                 primaryScriptPath,
@@ -157,9 +170,10 @@ namespace Nyks.HotReload.Editor.Core
                 out List<string> defineSymbols,
                 out List<string> projectAssemblyNames);
 
+            int totalCap = scriptFilePaths.Count + (companionScriptPaths != null ? companionScriptPaths.Count : 0);
             var combinedRewrite = new SourceRewriteResult();
-            var filePathsList = new List<string>(scriptFilePaths.Count);
-            var rewrittenSourcesList = new List<string>(scriptFilePaths.Count);
+            var filePathsList = new List<string>(totalCap);
+            var rewrittenSourcesList = new List<string>(totalCap);
 
             for (int i = 0; i < scriptFilePaths.Count; i++)
             {
@@ -225,11 +239,55 @@ namespace Nyks.HotReload.Editor.Core
                 return result;
             }
 
+            bool hasCompanionScripts = false;
+            if (companionScriptPaths != null && companionScriptPaths.Count > 0)
+            {
+                for (int i = 0; i < companionScriptPaths.Count; i++)
+                {
+                    string compPath = companionScriptPaths[i];
+                    if (string.IsNullOrEmpty(compPath) || !File.Exists(compPath))
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        string compRaw = ReadFileWithRetry(compPath);
+                        SourceRewriteResult compRewrite = HotReloadSourceRewriter.Rewrite(
+                            compRaw,
+                            projectAssemblyNames,
+                            ResolveLoadedTypeByName,
+                            emitSharedAssemblyBoilerplate: false);
+
+                        filePathsList.Add(compPath);
+                        rewrittenSourcesList.Add(compRewrite.RewrittenSource);
+                        hasCompanionScripts = true;
+
+                        foreach (string compType in compRewrite.DeclaredTypeNames)
+                        {
+                            if (!combinedRewrite.DeclaredTypeNames.Contains(compType))
+                            {
+                                combinedRewrite.CompanionTypeNames.Add(compType);
+                                int dotIdx = compType.LastIndexOf('.');
+                                if (dotIdx >= 0 && dotIdx + 1 < compType.Length)
+                                {
+                                    combinedRewrite.CompanionTypeNames.Add(compType.Substring(dotIdx + 1));
+                                }
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore unreadable companion script
+                    }
+                }
+            }
+
             result.RewriteInfo = combinedRewrite;
 
             string patchAssemblyName = $"NyksHotReload_Patch_{_patchSequenceId++}_{Guid.NewGuid().ToString("N").Substring(0, 6)}";
 
-            // Tier 1: Fast Warm In-Memory Roslyn (~40-100ms) with cached MetadataReferences.
+            // Tier 1: Fast Warm In-Memory Roslyn (~20-60ms) with cached MetadataReferences.
             if (TryCompileInMemoryRoslyn(
                 patchAssemblyName,
                 filePathsList,
@@ -237,16 +295,25 @@ namespace Nyks.HotReload.Editor.Core
                 referencePaths,
                 defineSymbols,
                 out System.Reflection.Assembly inMemAssembly,
+                out byte[] inMemPeBytes,
                 out List<CompilerDiagnosticEntry> inMemDiagnostics,
                 out bool shouldFallbackToDotNetSdk))
             {
                 stopwatch.Stop();
                 result.Success = true;
                 result.CompiledAssembly = inMemAssembly;
+                result.RawAssemblyBytes = inMemPeBytes;
                 result.EngineUsed = "In-Memory Roslyn";
                 result.CompileTimeMs = stopwatch.Elapsed.TotalMilliseconds;
                 result.Diagnostics.AddRange(inMemDiagnostics);
                 return result;
+            }
+
+            // If compilation failed when companion dirty scripts were included, retry compiling only the primary script(s)
+            // so a syntax error in an earlier modified file never blocks patching the currently saved file.
+            if (hasCompanionScripts)
+            {
+                return CompileScriptBatch(scriptFilePaths, null);
             }
 
             // If In-Memory Roslyn reported a clean user syntax error (and not a compiler/language-version limitation),
@@ -269,11 +336,13 @@ namespace Nyks.HotReload.Editor.Core
                 referencePaths,
                 defineSymbols,
                 out System.Reflection.Assembly cscAssembly,
+                out byte[] cscPeBytes,
                 out List<CompilerDiagnosticEntry> cscDiagnostics))
             {
                 stopwatch.Stop();
                 result.Success = true;
                 result.CompiledAssembly = cscAssembly;
+                result.RawAssemblyBytes = cscPeBytes;
                 result.EngineUsed = "Unity DotNetSdk Roslyn (csc)";
                 result.CompileTimeMs = stopwatch.Elapsed.TotalMilliseconds;
                 result.Diagnostics.AddRange(cscDiagnostics);
@@ -305,23 +374,60 @@ namespace Nyks.HotReload.Editor.Core
         }
 
         /// <summary>
-        /// Pre-resolves the compiler paths and caches assembly references so the first Hot Reload is instantaneous.
+        /// Pre-resolves the compiler paths, caches assembly MetadataReferences, and JIT-warms Roslyn's Emit pipeline
+        /// on a background thread so Play Mode entry has 0ms main-thread hitch and the first Hot Reload runs in ~20ms.
         /// </summary>
         public static void WarmUp()
         {
             try
             {
-                ResolveDotNetAndCscPaths(out _, out _);
-                EnsureInMemoryRoslynLoaded();
-                CollectCompilationContext(null, out List<string> refs, out _, out _);
-                if (_roslynAvailable && refs != null && refs.Count > 0)
-                {
-                    GetOrCreateMetadataReferences(refs);
-                }
+                _cachedEditorDataPath = EditorApplication.applicationContentsPath;
+                _isWindowsEditor = UnityEngine.Application.platform == UnityEngine.RuntimePlatform.WindowsEditor;
+                CollectCompilationContext(null, out List<string> refs, out List<string> defines, out _);
+
+                var refsCopy = refs != null ? new List<string>(refs) : null;
+                var definesCopy = defines != null ? new List<string>(defines) : new List<string>();
+
+                System.Threading.Tasks.Task.Run(() => WarmUpBackgroundCore(refsCopy, definesCopy));
             }
             catch
             {
                 // Non-fatal during warmup
+            }
+        }
+
+        private static void WarmUpBackgroundCore(List<string> refs, List<string> defines)
+        {
+            try
+            {
+                lock (_roslynCompileLock)
+                {
+                    ResolveDotNetAndCscPaths(out _, out _);
+                    EnsureInMemoryRoslynLoaded();
+                    if (_roslynAvailable && refs != null && refs.Count > 0)
+                    {
+                        GetOrCreateMetadataReferences(refs);
+                        if (!_roslynJitWarmedUp)
+                        {
+                            _roslynJitWarmedUp = true;
+                            TryCompileInMemoryRoslyn(
+                                "__NyksHotReload_WarmUp__",
+                                new[] { "WarmUp.cs" },
+                                new[] { "internal static class __NyksWarmUp { static void M() { } }" },
+                                refs,
+                                defines,
+                                out _,
+                                out _,
+                                out _,
+                                out _,
+                                loadCompiledAssembly: false);
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Non-fatal during background warmup
             }
         }
 
@@ -332,21 +438,26 @@ namespace Nyks.HotReload.Editor.Core
             List<string> referencePaths,
             List<string> defineSymbols,
             out System.Reflection.Assembly compiledAssembly,
+            out byte[] rawPeBytes,
             out List<CompilerDiagnosticEntry> diagnostics,
-            out bool shouldFallbackToDotNetSdk)
+            out bool shouldFallbackToDotNetSdk,
+            bool loadCompiledAssembly = true)
         {
             compiledAssembly = null;
+            rawPeBytes = null;
             diagnostics = new List<CompilerDiagnosticEntry>();
             shouldFallbackToDotNetSdk = true;
 
-            EnsureInMemoryRoslynLoaded();
-            if (!_roslynAvailable)
+            lock (_roslynCompileLock)
             {
-                return false;
-            }
+                EnsureInMemoryRoslynLoaded();
+                if (!_roslynAvailable)
+                {
+                    return false;
+                }
 
-            try
-            {
+                try
+                {
                 // 1. Create CSharpParseOptions with LanguageVersion.Preview / Latest & preprocessor symbols
                 object langVersion = Enum.IsDefined(_languageVersionType, "Preview")
                     ? Enum.Parse(_languageVersionType, "Preview")
@@ -632,15 +743,23 @@ namespace Nyks.HotReload.Editor.Core
                         return false;
                     }
 
+                    _roslynJitWarmedUp = true;
+                    if (!loadCompiledAssembly)
+                    {
+                        return true;
+                    }
+
                     byte[] peBytes = peStream.ToArray();
+                    rawPeBytes = peBytes;
                     compiledAssembly = System.Reflection.Assembly.Load(peBytes);
                     return compiledAssembly != null;
                 }
-            }
-            catch
-            {
-                shouldFallbackToDotNetSdk = true;
-                return false;
+                }
+                catch
+                {
+                    shouldFallbackToDotNetSdk = true;
+                    return false;
+                }
             }
         }
 
@@ -651,9 +770,11 @@ namespace Nyks.HotReload.Editor.Core
             List<string> referencePaths,
             List<string> defineSymbols,
             out System.Reflection.Assembly compiledAssembly,
+            out byte[] rawPeBytes,
             out List<CompilerDiagnosticEntry> diagnostics)
         {
             compiledAssembly = null;
+            rawPeBytes = null;
             diagnostics = new List<CompilerDiagnosticEntry>();
 
             if (!ResolveDotNetAndCscPaths(out string dotnetExe, out string cscDll))
@@ -751,6 +872,7 @@ namespace Nyks.HotReload.Editor.Core
                     }
 
                     byte[] peBytes = File.ReadAllBytes(outDll);
+                    rawPeBytes = peBytes;
                     compiledAssembly = System.Reflection.Assembly.Load(peBytes);
 
                     return compiledAssembly != null;
@@ -787,7 +909,9 @@ namespace Nyks.HotReload.Editor.Core
 
             try
             {
-                string editorDataPath = EditorApplication.applicationContentsPath;
+                string editorDataPath = !string.IsNullOrEmpty(_cachedEditorDataPath)
+                    ? _cachedEditorDataPath
+                    : EditorApplication.applicationContentsPath;
                 string mono45Dir = Path.Combine(editorDataPath, "MonoBleedingEdge", "lib", "mono", "4.5");
                 string roslynDir = Path.Combine(editorDataPath, "MonoBleedingEdge", "lib", "mono", "msbuild", "Current", "bin", "Roslyn");
 
@@ -1003,8 +1127,13 @@ namespace Nyks.HotReload.Editor.Core
 
                     if (fileName.StartsWith("NyksHotReload_Patch_", StringComparison.OrdinalIgnoreCase) ||
                         fileName.StartsWith("Microsoft.CodeAnalysis", StringComparison.OrdinalIgnoreCase) ||
+                        fileName.StartsWith("UnityPipeline.", StringComparison.OrdinalIgnoreCase) ||
+                        fileName.EndsWith(".ref.dll", StringComparison.OrdinalIgnoreCase) ||
                         full.IndexOf("NetStandard\\ref\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        full.IndexOf("NetStandard/ref/", StringComparison.OrdinalIgnoreCase) >= 0)
+                        full.IndexOf("NetStandard/ref/", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        full.IndexOf("NetStandard\\compat\\", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        full.IndexOf("NetStandard/compat/", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        full.IndexOf("TargetingPacks", StringComparison.OrdinalIgnoreCase) >= 0)
                     {
                         return;
                     }
@@ -1121,8 +1250,10 @@ namespace Nyks.HotReload.Editor.Core
                 return true;
             }
 
-            string editorData = EditorApplication.applicationContentsPath;
-            string exeName = UnityEngine.Application.platform == UnityEngine.RuntimePlatform.WindowsEditor ? "dotnet.exe" : "dotnet";
+            string editorData = !string.IsNullOrEmpty(_cachedEditorDataPath)
+                ? _cachedEditorDataPath
+                : EditorApplication.applicationContentsPath;
+            string exeName = _isWindowsEditor ? "dotnet.exe" : "dotnet";
 
             string[] dotnetCandidates =
             {

@@ -18,6 +18,7 @@ namespace Nyks.HotReload.Editor.Core
         public string RewrittenSource { get; set; }
         public List<DynamicFieldDescriptor> AddedFields { get; } = new List<DynamicFieldDescriptor>();
         public List<string> DeclaredTypeNames { get; } = new List<string>();
+        public HashSet<string> CompanionTypeNames { get; } = new HashSet<string>(StringComparer.Ordinal);
     }
 
     /// <summary>
@@ -34,6 +35,10 @@ namespace Nyks.HotReload.Editor.Core
 
         private static readonly Regex _classDeclRegex = new Regex(
             @"\b(?:public|internal|private|protected|sealed|abstract|partial|static|\s)*\bclass\s+([A-Za-z_][A-Za-z0-9_]*)",
+            RegexOptions.Compiled);
+
+        private static readonly Regex _typeDeclRegex = new Regex(
+            @"\b(?:public|internal|private|protected|sealed|abstract|partial|static|readonly|ref|\s)*\b(?:class|struct|interface|enum)\s+([A-Za-z_][A-Za-z0-9_]*)",
             RegexOptions.Compiled);
 
         // Matches single-line instance/static field declarations inside a class body.
@@ -59,12 +64,12 @@ namespace Nyks.HotReload.Editor.Core
                 detectedNamespace = nsMatch.Groups[1].Value.Trim();
             }
 
-            foreach (Match classMatch in _classDeclRegex.Matches(sourceCode))
+            foreach (Match typeMatch in _typeDeclRegex.Matches(sourceCode))
             {
-                string shortClassName = classMatch.Groups[1].Value.Trim();
+                string shortTypeName = typeMatch.Groups[1].Value.Trim();
                 string fullTypeName = string.IsNullOrEmpty(detectedNamespace)
-                    ? shortClassName
-                    : $"{detectedNamespace}.{shortClassName}";
+                    ? shortTypeName
+                    : $"{detectedNamespace}.{shortTypeName}";
 
                 if (!result.DeclaredTypeNames.Contains(fullTypeName))
                 {

@@ -270,6 +270,25 @@ namespace Nyks.HotReload.Editor.State
         }
 
         /// <summary>
+        /// Returns all registered dynamic fields across all types in the current session.
+        /// </summary>
+        public static List<DynamicFieldDescriptor> GetAllDynamicFields()
+        {
+            var result = new List<DynamicFieldDescriptor>();
+            lock (_syncRoot)
+            {
+                foreach (var kvp in _typeDescriptors)
+                {
+                    if (kvp.Value != null)
+                    {
+                        result.AddRange(kvp.Value);
+                    }
+                }
+            }
+            return result;
+        }
+
+        /// <summary>
         /// Clears all static stores and registered field descriptors when exiting Play Mode or performing a Domain Reload.
         /// </summary>
         public static void ClearAll()

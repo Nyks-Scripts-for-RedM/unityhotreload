@@ -63,6 +63,7 @@ namespace Nyks.HotReload.Editor.Core
         private const string PREF_ENABLED = "Nyks.HotReload.IsEnabled";
         private const string PREF_LOCK_DOMAIN_RELOAD = "Nyks.HotReload.LockDomainReload";
         private const string PREF_ALLOW_EDITMODE = "Nyks.HotReload.AllowEditModePatch_v3";
+        private const string PREF_SKIP_PLAYMODE_DOMAIN_RELOAD = "Nyks.HotReload.SkipPlayModeDomainReload_v1";
         private const string PREF_SHOW_TOAST = "Nyks.HotReload.ShowToast";
         private const string PREF_TRIGGER_MODE = "Nyks.HotReload.TriggerMode";
         private const string PREF_LANGUAGE = "Nyks.HotReload.Language";
@@ -72,15 +73,20 @@ namespace Nyks.HotReload.Editor.Core
         private const string UNITY_PREF_AUTOREFRESH_MODE = "kAutoRefreshMode";
 
         private const double DEBOUNCE_SECONDS = 0.08;
-        private const double POLL_INTERVAL_SECONDS = 0.30;
+        private const double POLL_INTERVAL_SECONDS = 0.25;
 
-        private static readonly Dictionary<string, long> _scriptLastWriteTicks =
+        private static readonly Dictionary<string, long> _sourceAssetDbTicks =
             new Dictionary<string, long>(256, StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, ulong> _scriptContentHashes =
+            new Dictionary<string, ulong>(256, StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, long> _dirtyScriptRealTicks =
+            new Dictionary<string, long>(64, StringComparer.OrdinalIgnoreCase);
         private static readonly ConcurrentDictionary<string, double> _pendingFiles =
             new ConcurrentDictionary<string, double>(StringComparer.OrdinalIgnoreCase);
 
         private static readonly List<HotReloadPatchEvent> _history = new List<HotReloadPatchEvent>(64);
         private static readonly HashSet<string> _dirtyScriptsSinceDomainReload = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> _uncompiledNewScripts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static readonly HashSet<string> _loggedReloadAdvisories = new HashSet<string>(StringComparer.Ordinal);
 
         private sealed class DynamicLifecycleHook
@@ -88,6 +94,8 @@ namespace Nyks.HotReload.Editor.Core
             public Type OriginalComponentType;
             public string MethodName;
             public IntPtr FunctionPointer;
+            public bool IsOneShot;
+            public HashSet<int> ExecutedInstanceIds;
         }
 
         private sealed class DynamicScheduledInvoke
@@ -131,7 +139,7 @@ namespace Nyks.HotReload.Editor.Core
 
         private static readonly HashSet<string> _unityNativeMessagesRequiringReload = new HashSet<string>(StringComparer.Ordinal)
         {
-            "Awake", "Start", "OnEnable", "OnDisable", "OnDestroy",
+            "OnDisable", "OnDestroy",
             "OnTriggerEnter", "OnTriggerStay", "OnTriggerExit",
             "OnTriggerEnter2D", "OnTriggerStay2D", "OnTriggerExit2D",
             "OnCollisionEnter", "OnCollisionStay", "OnCollisionExit",
@@ -144,6 +152,7 @@ namespace Nyks.HotReload.Editor.Core
         private static bool _isPerformingFullReload;
         private static bool _initialBaselineComplete;
         private static bool _newScriptFileCreated;
+        private static bool _requiresReloadOnExitPlayMode;
         private static double _lastPollTime;
         private static string _lastModifiedScriptPath;
         private static bool _warmedUp;
@@ -187,19 +196,79 @@ namespace Nyks.HotReload.Editor.Core
         }
 
         /// <summary>
-        /// When false (default), Edit Mode uses Unity's standard compilation so new classes, interfaces, and serialized fields
-        /// work out-of-the-box, while Play Mode automatically locks Domain Reload and hot-patches live changes.
+        /// Enables instant ~25ms Hot Patching in Edit Mode as well as Play Mode by pinning SourceAssetDB
+        /// timestamps on disk (preventing Unity 6 QuickSearch ASIAI0B double reloads) and caching patches
+        /// across Play Mode transitions.
         /// </summary>
         public static bool AllowEditModePatching
         {
-            get => EditorPrefs.GetBool(PREF_ALLOW_EDITMODE, false);
+            get => EditorPrefs.GetBool(PREF_ALLOW_EDITMODE, true);
             set
             {
-                if (EditorPrefs.GetBool(PREF_ALLOW_EDITMODE, false) != value)
+                if (EditorPrefs.GetBool(PREF_ALLOW_EDITMODE, true) != value)
                 {
                     EditorPrefs.SetBool(PREF_ALLOW_EDITMODE, value);
+                    if (!value && !EditorApplication.isPlaying && _dirtyScriptsSinceDomainReload.Count > 0)
+                    {
+                        ForceFullUnityReload();
+                        return;
+                    }
+                    if (value && !_initialBaselineComplete && !EditorApplication.isCompiling && !EditorApplication.isUpdating)
+                    {
+                        StartFileWatcher();
+                    }
                     UpdateAutoRefreshLockState();
                     OnStatusChanged?.Invoke();
+                }
+            }
+        }
+
+        private static bool CanHotPatchInCurrentMode()
+        {
+            return IsEnabled && (EditorApplication.isPlaying || AllowEditModePatching);
+        }
+
+        /// <summary>
+        /// When true (default), entering Play Mode skips Unity's native "Reloading assemblies for play mode" Domain Reload
+        /// (Project Settings > Editor > Enter Play Mode Settings > "Reload Scene only"). Scenes are still reloaded,
+        /// so scene objects run Awake/OnEnable/Start normally without a 4-5s Domain Reload wait on Play Mode entry.
+        /// </summary>
+        public static bool SkipDomainReloadOnEnterPlayMode
+        {
+            get => EditorPrefs.GetBool(PREF_SKIP_PLAYMODE_DOMAIN_RELOAD, true);
+            set
+            {
+                if (EditorPrefs.GetBool(PREF_SKIP_PLAYMODE_DOMAIN_RELOAD, true) != value)
+                {
+                    EditorPrefs.SetBool(PREF_SKIP_PLAYMODE_DOMAIN_RELOAD, value);
+                }
+                SyncEnterPlayModeSettings();
+                OnStatusChanged?.Invoke();
+            }
+        }
+
+        private static void SyncEnterPlayModeSettings()
+        {
+            if (EditorApplication.isPlayingOrWillChangePlaymode)
+            {
+                return;
+            }
+
+            bool skipReload = IsEnabled && EditorPrefs.GetBool(PREF_SKIP_PLAYMODE_DOMAIN_RELOAD, true);
+            if (skipReload)
+            {
+                if (!EditorSettings.enterPlayModeOptionsEnabled ||
+                    EditorSettings.enterPlayModeOptions != EnterPlayModeOptions.DisableDomainReload)
+                {
+                    EditorSettings.enterPlayModeOptionsEnabled = true;
+                    EditorSettings.enterPlayModeOptions = EnterPlayModeOptions.DisableDomainReload;
+                }
+            }
+            else
+            {
+                if ((EditorSettings.enterPlayModeOptions & EnterPlayModeOptions.DisableDomainReload) != 0)
+                {
+                    EditorSettings.enterPlayModeOptions &= ~EnterPlayModeOptions.DisableDomainReload;
                 }
             }
         }
@@ -301,6 +370,8 @@ namespace Nyks.HotReload.Editor.Core
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             EditorApplication.quitting += OnEditorQuitting;
             Application.logMessageReceived += OnUnityLogMessageReceived;
+            UnityEditor.Compilation.CompilationPipeline.compilationStarted += OnUnityCompilationStarted;
+            UnityEditor.Compilation.CompilationPipeline.compilationFinished += OnUnityCompilationFinished;
 
             HotReloadStateStore.OnScheduleDynamicInvoke = ScheduleDynamicInvoke;
             HotReloadStateStore.OnCancelDynamicInvoke = CancelDynamicInvoke;
@@ -308,25 +379,59 @@ namespace Nyks.HotReload.Editor.Core
             HotReloadStateStore.OnStartDynamicCoroutine = StartDynamicCoroutine;
             HotReloadStateStore.OnStopDynamicCoroutine = StopDynamicCoroutine;
 
-            // Immediately initialize file baseline and lock kAutoRefresh preferences during InitializeOnLoad
-            // so scripts edited in an external IDE while Unity is unfocused in the background are never missed
-            // when delayCall finally fires upon window focus.
-            StartFileWatcher();
-            UpdateAutoRefreshLockState();
-
-            EditorApplication.delayCall += () =>
+            // If we are entering Play Mode (or reloading in Edit Mode with AllowEditModePatching enabled),
+            // immediately restore and detour any cached Edit-Mode/Play-Mode patches BEFORE Unity invokes
+            // AwakeInstancesAfterBackupRestoration (Awake / OnEnable) on scene objects!
+            if (IsEnabled && (EditorApplication.isPlayingOrWillChangePlaymode || AllowEditModePatching))
             {
+                TryRestoreAndApplyCachedPatchOnDomainReload();
+            }
+
+            // Defer disk enumeration (StartFileWatcher) and EditorPrefs (kAutoRefresh / kAutoRefreshMode) mutation
+            // until the first EditorApplication.update tick after StopAssetImportingV2 finishes.
+            EditorApplication.CallbackFunction initOnFirstUpdate = null;
+            initOnFirstUpdate = () =>
+            {
+                if (EditorApplication.isCompiling || EditorApplication.isUpdating)
+                {
+                    return;
+                }
+                EditorApplication.update -= initOnFirstUpdate;
+
                 if (IsBackgroundWorkerOrBatchProcess())
                 {
                     return;
                 }
-                if (!_initialBaselineComplete)
+
+                if (SessionState.GetBool("Nyks.HotReload.ManualReloadRequested", false))
                 {
-                    StartFileWatcher();
+                    SessionState.SetBool("Nyks.HotReload.ManualReloadRequested", false);
+                    bool tr = IsTurkish;
+                    Debug.Log(tr
+                        ? "<color=#4ADE80><b>[⚡ Hot Reload Pro]</b></color> Tam Derleme tamamlandı — Hot Reload hazır!"
+                        : "<color=#4ADE80><b>[⚡ Hot Reload Pro]</b></color> Full Domain Reload complete — Hot Reload is ready!");
                 }
-                UpdateAutoRefreshLockState();
-                EnsureIdeProjectFilesSynced(force: false);
+
+                if (CanHotPatchInCurrentMode())
+                {
+                    if (!_initialBaselineComplete)
+                    {
+                        StartFileWatcher();
+                    }
+                    UpdateAutoRefreshLockState();
+                }
+                else if (!EditorApplication.isPlayingOrWillChangePlaymode)
+                {
+                    RestoreAutoRefreshPref();
+                }
+
+                if (!EditorApplication.isPlayingOrWillChangePlaymode)
+                {
+                    SyncEnterPlayModeSettings();
+                    EnsureIdeProjectFilesSynced(force: false);
+                }
             };
+            EditorApplication.update += initOnFirstUpdate;
         }
 
         /// <summary>
@@ -376,9 +481,22 @@ namespace Nyks.HotReload.Editor.Core
                 ? scriptNames[0]
                 : string.Join(", ", scriptNames);
 
+            // Include any other dirty scripts modified since the last Domain Reload as companion syntax trees
+            // so cross-script references (e.g. new constants in Consts.cs or new public methods in another modified script)
+            // resolve cleanly in In-Memory Roslyn without re-triggering field/detour checks on those companion scripts.
+            var companionPaths = new List<string>();
+            foreach (string dirtyPath in _dirtyScriptsSinceDomainReload)
+            {
+                if (!string.IsNullOrEmpty(dirtyPath) && File.Exists(dirtyPath) &&
+                    !validPaths.Exists(p => string.Equals(p, dirtyPath, StringComparison.OrdinalIgnoreCase)))
+                {
+                    companionPaths.Add(dirtyPath);
+                }
+            }
+
             var totalSw = System.Diagnostics.Stopwatch.StartNew();
 
-            HotReloadCompileResult compileResult = HotReloadCompilerService.CompileScriptBatch(validPaths);
+            HotReloadCompileResult compileResult = HotReloadCompilerService.CompileScriptBatch(validPaths, companionPaths);
 
             var evt = new HotReloadPatchEvent
             {
@@ -420,6 +538,8 @@ namespace Nyks.HotReload.Editor.Core
             int patchedCount = ApplyAssemblyDetours(
                 compileResult.CompiledAssembly,
                 evt.ScriptName,
+                compileResult.RewriteInfo?.DeclaredTypeNames,
+                compileResult.RewriteInfo?.CompanionTypeNames,
                 evt.PatchedMethods,
                 evt.Diagnostics,
                 out bool detourRequiresReload,
@@ -434,21 +554,14 @@ namespace Nyks.HotReload.Editor.Core
                 }
             }
 
+            if (evt.RequiresDomainReload && EditorApplication.isPlaying)
+            {
+                _requiresReloadOnExitPlayMode = true;
+            }
+
             totalSw.Stop();
             evt.Success = true;
             evt.TotalTimeMs = totalSw.Elapsed.TotalMilliseconds;
-
-            // If we are in Edit Mode (not playing) and the user made a structural change
-            // (e.g. added `: ICollectible`, added a new class, added a new public/interface method, or added OnTriggerEnter),
-            // automatically trigger a single clean Unity compilation so the user never has to manually click Full Reload!
-            if (!EditorApplication.isPlaying && evt.RequiresDomainReload)
-            {
-                Debug.Log(IsTurkish
-                    ? $"<color=#38BDF8><b>[⚡ Hot Reload Pro • Edit Mode]</b></color> <b>{evt.ScriptName}</b> içinde yapısal değişiklik algılandı ({evt.ReloadReason}). Unity derleyicisiyle otomatik eşitleniyor..."
-                    : $"<color=#38BDF8><b>[⚡ Hot Reload Pro • Edit Mode]</b></color> Structural change detected in <b>{evt.ScriptName}</b> ({evt.ReloadReason}). Automatically syncing with Unity compiler...");
-                ForceFullUnityReload();
-                return evt;
-            }
 
             if (patchedCount > 0 || evt.AddedFields.Count > 0 || evt.RequiresDomainReload)
             {
@@ -456,7 +569,23 @@ namespace Nyks.HotReload.Editor.Core
                 {
                     _dirtyScriptsSinceDomainReload.Add(validPaths[i]);
                 }
+
+                if (compileResult.RawAssemblyBytes != null && compileResult.RawAssemblyBytes.Length > 0)
+                {
+                    SavePatchCache(compileResult.RawAssemblyBytes, _requiresReloadOnExitPlayMode || evt.RequiresDomainReload);
+                }
+
                 RecordEvent(evt);
+            }
+
+            // Structural changes made in Edit Mode (new class/enum value/interface/serialized reference field) cannot be
+            // detoured safely, so trigger ONE clean Unity reload right away instead of leaving a half-applied patch that
+            // would later force an unexpected reload when entering Play Mode.
+            // (Normal method-body edits in Edit Mode or Play Mode NEVER trigger a Domain Reload!)
+            if (!EditorApplication.isPlaying && !EditorApplication.isPlayingOrWillChangePlaymode && evt.RequiresDomainReload)
+            {
+                ForceFullUnityReload();
+                return evt;
             }
 
             // Repaint all open Inspectors & SceneViews so changes appear immediately in Edit Mode and Play Mode
@@ -488,40 +617,71 @@ namespace Nyks.HotReload.Editor.Core
             _dynamicRunningCoroutines.Clear();
         }
 
+        private static void ClearPlayModeOnlyDynamicState()
+        {
+            _dynamicScheduledInvokes.Clear();
+            _dynamicRunningCoroutines.Clear();
+            foreach (var kvp in _dynamicLifecycleHooks)
+            {
+                if (kvp.Value != null && kvp.Value.ExecutedInstanceIds != null)
+                {
+                    kvp.Value.ExecutedInstanceIds.Clear();
+                }
+            }
+        }
+
         /// <summary>
-        /// Unlocks Auto-Refresh and triggers a clean Unity AssetDatabase Refresh outside the IMGUI loop.
-        /// Never re-locks Auto-Refresh until the Domain Reload has completed.
+        /// Unpins all modified .cs file timestamps on disk, unlocks Auto-Refresh, and triggers a clean Unity AssetDatabase Refresh.
         /// </summary>
         public static void ForceFullUnityReload()
         {
+            UnpinDirtyScriptTimestamps();
+            ClearPatchCache();
             _dirtyScriptsSinceDomainReload.Clear();
+            _dirtyScriptRealTicks.Clear();
+            _uncompiledNewScripts.Clear();
             _loggedReloadAdvisories.Clear();
             _pendingFiles.Clear();
+            _requiresReloadOnExitPlayMode = false;
             _isPerformingFullReload = true;
+            SessionState.SetBool("Nyks.HotReload.ManualReloadRequested", true);
             ReleaseAutoRefreshLock();
 
             ClearAllDynamicRuntimeState();
             NativeMethodDetour.RevertAll();
             HotReloadStateStore.ClearAll();
 
-            EditorApplication.delayCall += () =>
+            EditorApplication.CallbackFunction runReload = null;
+            runReload = () =>
             {
+                EditorApplication.update -= runReload;
                 if (_newScriptFileCreated)
                 {
                     _newScriptFileCreated = false;
                     EnsureIdeProjectFilesSynced(force: true);
                 }
 
-                AssetDatabase.Refresh(ImportAssetOptions.Default);
+                AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
 
                 // AssetDatabase.Refresh synchronously sets EditorApplication.isCompiling = true if any .cs file changed on disk.
                 // Only call RequestScriptReload when no script compilation was queued; otherwise RequestScriptReload
                 // forces a redundant second StopAssetImportingV2(ForceSynchronousImport | ForceDomainReload) pass!
                 if (!EditorApplication.isCompiling && !EditorApplication.isUpdating)
                 {
+                    if (EditorUtility.scriptCompilationFailed)
+                    {
+                        _isPerformingFullReload = false;
+                        SessionState.SetBool("Nyks.HotReload.ManualReloadRequested", false);
+                        bool tr = IsTurkish;
+                        Debug.LogWarning(tr
+                            ? "<color=#FBBF24><b>[⚠️ Hot Reload Pro]</b></color> Console'daki kırmızı C# kod hataları nedeniyle Unity Domain Reload yapamıyor. Önce kod hatalarını düzeltip kaydedin."
+                            : "<color=#FBBF24><b>[⚠️ Hot Reload Pro]</b></color> Unity cannot perform a Domain Reload while C# compiler errors exist in the Console.");
+                        return;
+                    }
                     EditorUtility.RequestScriptReload();
                 }
             };
+            EditorApplication.update += runReload;
         }
 
         /// <summary>
@@ -580,7 +740,7 @@ namespace Nyks.HotReload.Editor.Core
         {
             try
             {
-                _scriptLastWriteTicks.Clear();
+                _uncompiledNewScripts.Clear();
                 string assetsPath = Application.dataPath;
                 if (!Directory.Exists(assetsPath))
                 {
@@ -591,7 +751,14 @@ namespace Nyks.HotReload.Editor.Core
                 {
                     try
                     {
-                        _scriptLastWriteTicks[filePath] = File.GetLastWriteTimeUtc(filePath).Ticks;
+                        if (!_sourceAssetDbTicks.ContainsKey(filePath))
+                        {
+                            _sourceAssetDbTicks[filePath] = File.GetLastWriteTimeUtc(filePath).Ticks;
+                        }
+                        if (!_scriptContentHashes.ContainsKey(filePath))
+                        {
+                            _scriptContentHashes[filePath] = ComputeFileHash64(filePath);
+                        }
                     }
                     catch
                     {
@@ -609,13 +776,14 @@ namespace Nyks.HotReload.Editor.Core
 
         private static void DisposeFileWatcher()
         {
-            _scriptLastWriteTicks.Clear();
+            _uncompiledNewScripts.Clear();
             _pendingFiles.Clear();
         }
 
         private static void PollModifiedScriptsMainThread()
         {
-            if (!_initialBaselineComplete || !IsEnabled || _isPerformingFullReload || EditorApplication.isCompiling || EditorApplication.isUpdating)
+            if (!CanHotPatchInCurrentMode() || !_initialBaselineComplete || _isPerformingFullReload ||
+                EditorApplication.isCompiling || EditorApplication.isUpdating)
             {
                 return;
             }
@@ -626,6 +794,11 @@ namespace Nyks.HotReload.Editor.Core
             }
             _lastPollTime = EditorApplication.timeSinceStartup;
 
+            ScanModifiedScriptsCore(queueForLivePatch: true);
+        }
+
+        private static void ScanModifiedScriptsCore(bool queueForLivePatch)
+        {
             string assetsPath = Application.dataPath;
             if (string.IsNullOrEmpty(assetsPath) || !Directory.Exists(assetsPath))
             {
@@ -652,23 +825,42 @@ namespace Nyks.HotReload.Editor.Core
                         continue;
                     }
 
-                    if (_scriptLastWriteTicks.TryGetValue(filePath, out long previousTicks))
+                    if (_sourceAssetDbTicks.TryGetValue(filePath, out long pinnedTicks))
                     {
-                        if (currentTicks > previousTicks)
+                        if (currentTicks != pinnedTicks)
                         {
-                            _scriptLastWriteTicks[filePath] = currentTicks;
-                            if (EditorApplication.isPlaying || AllowEditModePatching)
+                            ulong currentHash = ComputeFileHash64(filePath);
+
+                            // Immediately pin the file's LastWriteTimeUtc on disk back to Unity's SourceAssetDB timestamp!
+                            // This prevents Unity 6's background AssetImportWorker (QuickSearch ASIAI0B / PreviewImporter)
+                            // from throwing Import Error Code:(4) (SourceDataChangedDuringImport) and forcing a Domain Reload.
+                            TryPinFileTimestampToSourceAssetDb(filePath, pinnedTicks);
+
+                            bool contentChanged = !_scriptContentHashes.TryGetValue(filePath, out ulong prevHash) ||
+                                                  (currentHash != 0UL && currentHash != prevHash);
+                            if (contentChanged)
                             {
-                                QueueScriptChange(filePath);
+                                _scriptContentHashes[filePath] = currentHash;
+                                _dirtyScriptRealTicks[filePath] = currentTicks > pinnedTicks ? currentTicks : DateTime.UtcNow.Ticks;
+                                _dirtyScriptsSinceDomainReload.Add(filePath);
+                                if (queueForLivePatch && CanHotPatchInCurrentMode())
+                                {
+                                    QueueScriptChange(filePath);
+                                }
                             }
                         }
                     }
                     else
                     {
                         // Newly created script file: record baseline and mark for IDE .csproj sync
-                        _scriptLastWriteTicks[filePath] = currentTicks;
+                        ulong currentHash = ComputeFileHash64(filePath);
+                        _sourceAssetDbTicks[filePath] = currentTicks;
+                        _scriptContentHashes[filePath] = currentHash;
+                        _dirtyScriptRealTicks[filePath] = currentTicks;
                         _newScriptFileCreated = true;
-                        if (EditorApplication.isPlaying || AllowEditModePatching)
+                        _uncompiledNewScripts.Add(filePath);
+                        _dirtyScriptsSinceDomainReload.Add(filePath);
+                        if (queueForLivePatch && CanHotPatchInCurrentMode())
                         {
                             QueueScriptChange(filePath);
                         }
@@ -688,7 +880,7 @@ namespace Nyks.HotReload.Editor.Core
                 return;
             }
 
-            if (!EditorApplication.isPlaying && !AllowEditModePatching)
+            if (!CanHotPatchInCurrentMode())
             {
                 return;
             }
@@ -714,12 +906,21 @@ namespace Nyks.HotReload.Editor.Core
                 return;
             }
 
-            // Pre-resolve compiler paths and warm up metadata cache 1.0s after Editor domain reload
-            if (!_warmedUp && EditorApplication.timeSinceStartup - _startupTime > 1.0)
+            // Pre-resolve compiler paths, warm up MetadataReferences, and JIT-warm Roslyn on a background thread
+            // 1.0s after Editor domain reload so Play Mode has 0ms main-thread hitch and ~20ms first compile.
+            if (!_warmedUp && !EditorApplication.isCompiling && !EditorApplication.isUpdating &&
+                EditorApplication.timeSinceStartup - _startupTime > 1.0)
             {
                 _warmedUp = true;
                 HotReloadCompilerService.WarmUp();
-                UpdateAutoRefreshLockState();
+                if (CanHotPatchInCurrentMode())
+                {
+                    if (!_initialBaselineComplete)
+                    {
+                        StartFileWatcher();
+                    }
+                    UpdateAutoRefreshLockState();
+                }
             }
 
             PollModifiedScriptsMainThread();
@@ -729,16 +930,10 @@ namespace Nyks.HotReload.Editor.Core
                 return;
             }
 
-            if (!IsEnabled || EditorApplication.isCompiling)
+            if (!CanHotPatchInCurrentMode() || EditorApplication.isCompiling || EditorApplication.isUpdating)
             {
                 _pendingFiles.Clear();
-                return;
-            }
-
-            bool canPatchNow = EditorApplication.isPlaying || AllowEditModePatching;
-            if (!canPatchNow)
-            {
-                _pendingFiles.Clear();
+                _uncompiledNewScripts.Clear();
                 return;
             }
 
@@ -766,13 +961,27 @@ namespace Nyks.HotReload.Editor.Core
             }
 
             var validBatchPaths = new List<string>(readyPaths.Count);
+
             foreach (string path in readyPaths)
             {
                 _pendingFiles.TryRemove(path, out _);
-                if (File.Exists(path))
+                if (!File.Exists(path))
                 {
-                    validBatchPaths.Add(path);
+                    continue;
                 }
+
+                if (_uncompiledNewScripts.Contains(path))
+                {
+                    if (!HasNonWhitespaceContent(path))
+                    {
+                        // Newly created empty file (e.g., 'New File' in IDE); wait until user writes code and saves.
+                        continue;
+                    }
+
+                    _uncompiledNewScripts.Remove(path);
+                }
+
+                validBatchPaths.Add(path);
             }
 
             if (validBatchPaths.Count > 0)
@@ -781,40 +990,174 @@ namespace Nyks.HotReload.Editor.Core
             }
         }
 
+        private static void FlushPendingPatchesImmediately()
+        {
+            if (_pendingFiles.IsEmpty)
+            {
+                return;
+            }
+
+            var batch = new List<string>();
+            foreach (var kvp in _pendingFiles)
+            {
+                if (File.Exists(kvp.Key) && HasNonWhitespaceContent(kvp.Key))
+                {
+                    batch.Add(kvp.Key);
+                }
+            }
+            _pendingFiles.Clear();
+
+            if (batch.Count > 0)
+            {
+                PatchScriptsBatchNow(batch);
+            }
+        }
+
+        private static bool HasNonWhitespaceContent(string filePath)
+        {
+            try
+            {
+                var info = new FileInfo(filePath);
+                if (!info.Exists || info.Length == 0)
+                {
+                    return false;
+                }
+
+                string text = File.ReadAllText(filePath);
+                return !string.IsNullOrWhiteSpace(text);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private static void OnPlayModeStateChanged(PlayModeStateChange state)
         {
             switch (state)
             {
                 case PlayModeStateChange.ExitingEditMode:
-                    // Clear any leftover Edit Mode queue so entering Play Mode never triggers a false Play-Mode patch
-                    _pendingFiles.Clear();
+                    // If the user saved a file in their IDE right before clicking Play (or with TriggerMode == OnUnityFocus),
+                    // scan, pin its timestamp to SourceAssetDB, and compile it into the Cross-Domain Patch Cache now
+                    // so Play Mode starts with the latest code and zero extra Domain Reload!
+                    if (IsEnabled && AllowEditModePatching && _initialBaselineComplete)
+                    {
+                        ScanModifiedScriptsCore(queueForLivePatch: true);
+                        FlushPendingPatchesImmediately();
+                    }
+                    else
+                    {
+                        _pendingFiles.Clear();
+                        _uncompiledNewScripts.Clear();
+                        ReleaseAutoRefreshLock();
+                    }
                     break;
 
                 case PlayModeStateChange.EnteredPlayMode:
                     _pendingFiles.Clear();
-                    StartFileWatcher();
+                    if (!_initialBaselineComplete)
+                    {
+                        StartFileWatcher();
+                    }
                     UpdateAutoRefreshLockState();
+                    ExecutePendingOneShotLifecycleHooks();
+                    break;
+
+                case PlayModeStateChange.ExitingPlayMode:
+                    if (IsEnabled && _initialBaselineComplete)
+                    {
+                        ScanModifiedScriptsCore(queueForLivePatch: true);
+                        FlushPendingPatchesImmediately();
+                    }
+                    _pendingFiles.Clear();
+                    ClearPlayModeOnlyDynamicState();
+                    if (!AllowEditModePatching || !IsEnabled)
+                    {
+                        RevertAllPatches();
+                    }
                     break;
 
                 case PlayModeStateChange.EnteredEditMode:
                     _pendingFiles.Clear();
-                    UpdateAutoRefreshLockState();
-                    // If Edit-Mode patching is disabled, sync with Unity when exiting Play Mode.
-                    // If Edit-Mode patching is enabled, keep patches active and Editor unfrozen!
-                    if (!AllowEditModePatching && _dirtyScriptsSinceDomainReload.Count > 0)
+                    if (_initialBaselineComplete)
                     {
-                        _dirtyScriptsSinceDomainReload.Clear();
+                        ScanModifiedScriptsCore(queueForLivePatch: false);
+                    }
+
+                    // Only trigger a full Unity recompile on exit Play Mode if:
+                    // 1. Edit Mode Hot Patching is disabled, OR
+                    // 2. A structural change (new MonoBehaviour class, new [SerializeField] ref, or enum change) occurred during Play Mode.
+                    if (!AllowEditModePatching || !IsEnabled || _requiresReloadOnExitPlayMode || _newScriptFileCreated)
+                    {
+                        _initialBaselineComplete = false;
                         RevertAllPatches();
                         ReleaseAutoRefreshLock();
-                        AssetDatabase.Refresh();
+
+                        if (_dirtyScriptsSinceDomainReload.Count > 0 || _newScriptFileCreated)
+                        {
+                            UnpinDirtyScriptTimestamps();
+                            ClearPatchCache();
+                            _dirtyScriptsSinceDomainReload.Clear();
+                            _dirtyScriptRealTicks.Clear();
+                            _requiresReloadOnExitPlayMode = false;
+                            if (_newScriptFileCreated)
+                            {
+                                _newScriptFileCreated = false;
+                                EnsureIdeProjectFilesSynced(force: true);
+                            }
+                            AssetDatabase.Refresh(ImportAssetOptions.Default);
+                        }
+                    }
+                    else
+                    {
+                        if (!_initialBaselineComplete)
+                        {
+                            StartFileWatcher();
+                        }
+                        UpdateAutoRefreshLockState();
                     }
                     break;
             }
             OnStatusChanged?.Invoke();
         }
 
+        private static void OnUnityCompilationStarted(object _)
+        {
+            // Whenever Unity's own script compiler starts compiling, unpin all dirty script timestamps
+            // and clear the patch cache so the newly compiled Assembly-CSharp.dll becomes the clean baseline.
+            UnpinDirtyScriptTimestamps();
+            ClearPatchCache();
+            _dirtyScriptsSinceDomainReload.Clear();
+            _dirtyScriptRealTicks.Clear();
+            _requiresReloadOnExitPlayMode = false;
+        }
+
+        private static void OnUnityCompilationFinished(object _)
+        {
+            // If compilation finished with errors, Unity aborts the Domain Reload ("Editor compiler errors found. Will not reload assemblies.").
+            // Reset _isPerformingFullReload so Hot Reload Pro never stays stuck waiting for a reload that Unity aborted!
+            if (EditorUtility.scriptCompilationFailed)
+            {
+                _isPerformingFullReload = false;
+                if (SessionState.GetBool("Nyks.HotReload.ManualReloadRequested", false))
+                {
+                    SessionState.SetBool("Nyks.HotReload.ManualReloadRequested", false);
+                    bool tr = IsTurkish;
+                    Debug.LogWarning(tr
+                        ? "<color=#FBBF24><b>[⚠️ Hot Reload Pro]</b></color> Console'daki kırmızı C# kod hataları nedeniyle Unity Domain Reload işlemini durdurdu. Hataları düzeltip kaydettiğinizde derleme tamamlanacaktır."
+                        : "<color=#FBBF24><b>[⚠️ Hot Reload Pro]</b></color> Unity aborted the Domain Reload due to C# compiler errors in the Console.");
+                }
+            }
+        }
+
         private static void OnBeforeAssemblyReload()
         {
+            if (EditorApplication.isCompiling)
+            {
+                UnpinDirtyScriptTimestamps();
+                ClearPatchCache();
+            }
+
             DisposeFileWatcher();
             ClearAllDynamicRuntimeState();
             NativeMethodDetour.ClearOnDomainUnload();
@@ -829,6 +1172,8 @@ namespace Nyks.HotReload.Editor.Core
 
         private static void OnEditorQuitting()
         {
+            UnpinDirtyScriptTimestamps();
+            ClearPatchCache();
             OnBeforeAssemblyReload();
             ReleaseAutoRefreshLock();
         }
@@ -840,12 +1185,9 @@ namespace Nyks.HotReload.Editor.Core
                 return;
             }
 
-            // Lock kAutoRefresh ONLY when actively in Play Mode (or if user explicitly enabled Edit-Mode Patching).
-            // Never lock during ExitingEditMode before Play Mode starts, so Unity can always compile Edit-Mode script changes first!
-            bool shouldDisableAutoRefreshPref = IsEnabled && LockPlayModeAutoRefresh &&
-                                                (EditorApplication.isPlaying || AllowEditModePatching);
+            bool shouldLock = IsEnabled && LockPlayModeAutoRefresh && (EditorApplication.isPlaying || AllowEditModePatching);
 
-            if (shouldDisableAutoRefreshPref)
+            if (shouldLock)
             {
                 if (!EditorPrefs.HasKey(PREF_SAVED_UNITY_AUTOREFRESH))
                 {
@@ -868,14 +1210,12 @@ namespace Nyks.HotReload.Editor.Core
                 return;
             }
 
-            // Only use C++ AssetDatabase.DisallowAutoRefresh() during active Play Mode
-            bool shouldDisallowInPlayMode = IsEnabled && LockPlayModeAutoRefresh && EditorApplication.isPlaying;
-            if (shouldDisallowInPlayMode && !_autoRefreshLockedByUs)
+            if (shouldLock && !_autoRefreshLockedByUs)
             {
                 AssetDatabase.DisallowAutoRefresh();
                 _autoRefreshLockedByUs = true;
             }
-            else if (!shouldDisallowInPlayMode && _autoRefreshLockedByUs)
+            else if (!shouldLock && _autoRefreshLockedByUs)
             {
                 AssetDatabase.AllowAutoRefresh();
                 _autoRefreshLockedByUs = false;
@@ -908,7 +1248,7 @@ namespace Nyks.HotReload.Editor.Core
             }
             else if (!EditorApplication.isPlaying && !AllowEditModePatching)
             {
-                // Ensure Unity Auto-Refresh is never left disabled in Edit Mode
+                // Ensure Unity Auto-Refresh is never left disabled when Edit Mode Hot Patching is turned off
                 if (EditorPrefs.GetInt(UNITY_PREF_AUTOREFRESH_MODE, 1) == 0)
                 {
                     EditorPrefs.SetBool(UNITY_PREF_AUTOREFRESH, true);
@@ -918,9 +1258,389 @@ namespace Nyks.HotReload.Editor.Core
             }
         }
 
+        private static ulong ComputeFileHash64(string filePath)
+        {
+            try
+            {
+                for (int attempt = 0; attempt < 3; attempt++)
+                {
+                    try
+                    {
+                        using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                        {
+                            ulong hash = 14695981039346656037UL;
+                            byte[] buf = new byte[4096];
+                            int read;
+                            while ((read = fs.Read(buf, 0, buf.Length)) > 0)
+                            {
+                                for (int i = 0; i < read; i++)
+                                {
+                                    hash ^= buf[i];
+                                    hash *= 1099511628211UL;
+                                }
+                            }
+                            return hash == 0UL ? 1UL : hash;
+                        }
+                    }
+                    catch (IOException)
+                    {
+                        if (attempt == 2) throw;
+                        System.Threading.Thread.Sleep(5);
+                    }
+                }
+            }
+            catch
+            {
+                // Fallback if file is temporarily locked
+            }
+            return 0UL;
+        }
+
+        private static void TryPinFileTimestampToSourceAssetDb(string filePath, long pinnedTicks)
+        {
+            if (pinnedTicks <= 0 || string.IsNullOrEmpty(filePath))
+            {
+                return;
+            }
+
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                try
+                {
+                    File.SetLastWriteTimeUtc(filePath, new DateTime(pinnedTicks, DateTimeKind.Utc));
+                    return;
+                }
+                catch (IOException)
+                {
+                    if (attempt < 2)
+                    {
+                        System.Threading.Thread.Sleep(5);
+                    }
+                }
+                catch
+                {
+                    return;
+                }
+            }
+        }
+
+        private static void UnpinDirtyScriptTimestamps()
+        {
+            try
+            {
+                long nowTicks = DateTime.UtcNow.Ticks;
+                foreach (string dirtyPath in _dirtyScriptsSinceDomainReload)
+                {
+                    if (string.IsNullOrEmpty(dirtyPath) || !File.Exists(dirtyPath))
+                    {
+                        continue;
+                    }
+
+                    long targetTicks = nowTicks;
+                    if (_dirtyScriptRealTicks.TryGetValue(dirtyPath, out long realTicks) && realTicks > targetTicks)
+                    {
+                        targetTicks = realTicks;
+                    }
+
+                    try
+                    {
+                        File.SetLastWriteTimeUtc(dirtyPath, new DateTime(targetTicks, DateTimeKind.Utc));
+                        _sourceAssetDbTicks[dirtyPath] = targetTicks;
+                    }
+                    catch
+                    {
+                        // Ignore inaccessible files
+                    }
+                }
+            }
+            catch
+            {
+                // Non-fatal
+            }
+        }
+
+        private static string GetPatchCacheDir()
+        {
+            try
+            {
+                string assetsPath = Application.dataPath;
+                if (string.IsNullOrEmpty(assetsPath))
+                {
+                    return null;
+                }
+
+                DirectoryInfo parent = Directory.GetParent(assetsPath);
+                return parent != null ? Path.Combine(parent.FullName, "Library", "HotReloadPatchCache") : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static long GetPrimaryScriptAssemblyTicks()
+        {
+            try
+            {
+                string assetsPath = Application.dataPath;
+                if (string.IsNullOrEmpty(assetsPath))
+                {
+                    return 0L;
+                }
+
+                DirectoryInfo parent = Directory.GetParent(assetsPath);
+                if (parent == null)
+                {
+                    return 0L;
+                }
+
+                string asmPath = Path.Combine(parent.FullName, "Library", "ScriptAssemblies", "Assembly-CSharp.dll");
+                if (File.Exists(asmPath))
+                {
+                    return File.GetLastWriteTimeUtc(asmPath).Ticks;
+                }
+            }
+            catch
+            {
+                // Ignore
+            }
+            return 0L;
+        }
+
+        private static void SavePatchCache(byte[] peBytes, bool requiresReloadOnExit)
+        {
+            try
+            {
+                string cacheDir = GetPatchCacheDir();
+                if (string.IsNullOrEmpty(cacheDir) || peBytes == null || peBytes.Length == 0)
+                {
+                    return;
+                }
+
+                Directory.CreateDirectory(cacheDir);
+                string binPath = Path.Combine(cacheDir, "latest_patch.bin");
+                string statePath = Path.Combine(cacheDir, "dirty_state.txt");
+
+                File.WriteAllBytes(binPath, peBytes);
+
+                var sb = new System.Text.StringBuilder(2048);
+                sb.AppendLine($"ASM_TICKS|{GetPrimaryScriptAssemblyTicks()}");
+                sb.AppendLine($"REQ_RELOAD|{(requiresReloadOnExit ? 1 : 0)}");
+
+                foreach (string dirtyPath in _dirtyScriptsSinceDomainReload)
+                {
+                    if (string.IsNullOrEmpty(dirtyPath))
+                    {
+                        continue;
+                    }
+                    long pinned = _sourceAssetDbTicks.TryGetValue(dirtyPath, out long pt) ? pt : 0L;
+                    long real = _dirtyScriptRealTicks.TryGetValue(dirtyPath, out long rt) ? rt : DateTime.UtcNow.Ticks;
+                    ulong hash = _scriptContentHashes.TryGetValue(dirtyPath, out ulong h) ? h : 0UL;
+                    sb.AppendLine($"DIRTY|{dirtyPath}|{pinned}|{real}|{hash}");
+                }
+
+                List<DynamicFieldDescriptor> allFields = HotReloadStateStore.GetAllDynamicFields();
+                for (int i = 0; i < allFields.Count; i++)
+                {
+                    DynamicFieldDescriptor f = allFields[i];
+                    if (f == null || string.IsNullOrEmpty(f.OwnerTypeFullName) || string.IsNullOrEmpty(f.FieldName))
+                    {
+                        continue;
+                    }
+                    sb.AppendLine($"FIELD|{f.OwnerTypeFullName}|{f.FieldName}|{f.DeclaredTypeName}|{f.FieldKey}|{(f.IsStatic ? 1 : 0)}|{(f.IsPublicOrSerialized ? 1 : 0)}|{(f.RequiresUnityObjectSerialization ? 1 : 0)}");
+                }
+
+                File.WriteAllText(statePath, sb.ToString(), System.Text.Encoding.UTF8);
+            }
+            catch
+            {
+                // Non-fatal if cache write fails
+            }
+        }
+
+        private static bool TryRestoreAndApplyCachedPatchOnDomainReload()
+        {
+            try
+            {
+                string cacheDir = GetPatchCacheDir();
+                if (string.IsNullOrEmpty(cacheDir))
+                {
+                    return false;
+                }
+
+                string binPath = Path.Combine(cacheDir, "latest_patch.bin");
+                string statePath = Path.Combine(cacheDir, "dirty_state.txt");
+                if (!File.Exists(binPath) || !File.Exists(statePath))
+                {
+                    return false;
+                }
+
+                string[] lines = File.ReadAllLines(statePath, System.Text.Encoding.UTF8);
+                long savedAsmTicks = -1L;
+                long currentAsmTicks = GetPrimaryScriptAssemblyTicks();
+
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    string line = lines[i];
+                    if (string.IsNullOrWhiteSpace(line))
+                    {
+                        continue;
+                    }
+
+                    string[] parts = line.Split('|');
+                    if (parts.Length >= 2 && parts[0] == "ASM_TICKS")
+                    {
+                        long.TryParse(parts[1], out savedAsmTicks);
+                        break;
+                    }
+                }
+
+                // If Unity recompiled Assembly-CSharp.dll since the cache was saved, discard the cache.
+                if (savedAsmTicks <= 0L || savedAsmTicks != currentAsmTicks)
+                {
+                    ClearPatchCache();
+                    return false;
+                }
+
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    string line = lines[i];
+                    if (string.IsNullOrWhiteSpace(line))
+                    {
+                        continue;
+                    }
+
+                    string[] parts = line.Split('|');
+                    if (parts[0] == "REQ_RELOAD" && parts.Length >= 2)
+                    {
+                        _requiresReloadOnExitPlayMode = parts[1] == "1";
+                    }
+                    else if (parts[0] == "DIRTY" && parts.Length >= 5)
+                    {
+                        string path = parts[1];
+                        if (!string.IsNullOrEmpty(path) && File.Exists(path))
+                        {
+                            _dirtyScriptsSinceDomainReload.Add(path);
+                            if (long.TryParse(parts[2], out long pinned) && pinned > 0L)
+                            {
+                                _sourceAssetDbTicks[path] = pinned;
+                            }
+                            if (long.TryParse(parts[3], out long real) && real > 0L)
+                            {
+                                _dirtyScriptRealTicks[path] = real;
+                            }
+                            if (ulong.TryParse(parts[4], out ulong hash) && hash > 0UL)
+                            {
+                                _scriptContentHashes[path] = hash;
+                            }
+                        }
+                    }
+                    else if (parts[0] == "FIELD" && parts.Length >= 8)
+                    {
+                        HotReloadStateStore.RegisterDynamicField(new DynamicFieldDescriptor
+                        {
+                            OwnerTypeFullName = parts[1],
+                            FieldName = parts[2],
+                            DeclaredTypeName = parts[3],
+                            FieldKey = parts[4],
+                            IsStatic = parts[5] == "1",
+                            IsPublicOrSerialized = parts[6] == "1",
+                            RequiresUnityObjectSerialization = parts[7] == "1"
+                        });
+                    }
+                }
+
+                byte[] peBytes = File.ReadAllBytes(binPath);
+                if (peBytes == null || peBytes.Length == 0)
+                {
+                    return false;
+                }
+
+                Assembly patchAsm = Assembly.Load(peBytes);
+                if (patchAsm == null)
+                {
+                    return false;
+                }
+
+                ApplyAssemblyDetours(
+                    patchAsm,
+                    "CachedPatch",
+                    primaryDeclaredTypeNames: null,
+                    companionTypeNames: null,
+                    new List<string>(),
+                    new List<CompilerDiagnosticEntry>(),
+                    out _,
+                    out _);
+
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void ClearPatchCache()
+        {
+            try
+            {
+                string cacheDir = GetPatchCacheDir();
+                if (string.IsNullOrEmpty(cacheDir) || !Directory.Exists(cacheDir))
+                {
+                    return;
+                }
+
+                string binPath = Path.Combine(cacheDir, "latest_patch.bin");
+                string statePath = Path.Combine(cacheDir, "dirty_state.txt");
+                if (File.Exists(binPath)) File.Delete(binPath);
+                if (File.Exists(statePath)) File.Delete(statePath);
+            }
+            catch
+            {
+                // Ignore
+            }
+        }
+
+        private static bool IsCompanionOnlyType(
+            Type patchType,
+            List<string> primaryDeclaredTypeNames,
+            HashSet<string> companionTypeNames)
+        {
+            if (patchType == null || companionTypeNames == null || companionTypeNames.Count == 0)
+            {
+                return false;
+            }
+
+            Type rootType = patchType;
+            while (rootType.DeclaringType != null)
+            {
+                rootType = rootType.DeclaringType;
+            }
+
+            string fullName = rootType.FullName ?? rootType.Name;
+            string shortName = rootType.Name;
+
+            if (primaryDeclaredTypeNames != null)
+            {
+                for (int i = 0; i < primaryDeclaredTypeNames.Count; i++)
+                {
+                    string primary = primaryDeclaredTypeNames[i];
+                    if (string.Equals(primary, fullName, StringComparison.Ordinal) ||
+                        string.Equals(primary, shortName, StringComparison.Ordinal))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return companionTypeNames.Contains(fullName) || companionTypeNames.Contains(shortName);
+        }
+
         private static int ApplyAssemblyDetours(
             Assembly patchAssembly,
             string scriptName,
+            List<string> primaryDeclaredTypeNames,
+            HashSet<string> companionTypeNames,
             List<string> patchedMethodNamesOut,
             List<CompilerDiagnosticEntry> diagnosticsOut,
             out bool requiresDomainReload,
@@ -960,9 +1680,22 @@ namespace Nyks.HotReload.Editor.Core
                     continue;
                 }
 
+                if (companionTypeNames != null && companionTypeNames.Count > 0 &&
+                    IsCompanionOnlyType(patchType, primaryDeclaredTypeNames, companionTypeNames))
+                {
+                    continue;
+                }
+
                 Type originalType = FindOriginalRuntimeType(patchType);
                 if (originalType == null)
                 {
+                    // Pure constant/static containers (e.g. `public struct CatAnimations { public const string ... }` in Consts.cs)
+                    // have no instance layout or Unity engine registration requirements and never need a Domain Reload.
+                    if (IsPureConstOrStaticContainer(patchType))
+                    {
+                        continue;
+                    }
+
                     requiresDomainReload = true;
                     reloadReason = $"New type '{patchType.Name}' added";
                     LogDomainReloadAdvisoryOnce(
@@ -1008,12 +1741,15 @@ namespace Nyks.HotReload.Editor.Core
                 }
                 else if (patchType.IsValueType && !patchType.IsEnum)
                 {
-                    requiresDomainReload = true;
-                    reloadReason = $"Struct '{patchType.Name}' modified";
-                    LogDomainReloadAdvisoryOnce(
-                        $"StructType:{patchType.FullName}",
-                        $"Struct (<b>{patchType.Name}</b>) was modified in <b>{scriptName}</b>. " +
-                        "To realign value-type memory layouts, click <b>Tools > Hot Reload Pro > Full Domain Reload</b> once.");
+                    if (!AreInstanceFieldLayoutsCompatible(originalType, patchType))
+                    {
+                        requiresDomainReload = true;
+                        reloadReason = $"Struct '{patchType.Name}' layout modified";
+                        LogDomainReloadAdvisoryOnce(
+                            $"StructType:{patchType.FullName}",
+                            $"Struct (<b>{patchType.Name}</b>) instance layout was modified in <b>{scriptName}</b>. " +
+                            "To realign value-type memory layouts, click <b>Tools > Hot Reload Pro > Full Domain Reload</b> once.");
+                    }
                 }
                 else if (HasInheritanceOrInterfaceChanges(originalType, patchType))
                 {
@@ -1067,15 +1803,27 @@ namespace Nyks.HotReload.Editor.Core
 
                         if (isMonoBehaviour && !patchMethod.IsStatic)
                         {
-                            if (patchMethod.GetParameters().Length == 0 &&
-                                (patchMethod.Name == "Update" || patchMethod.Name == "LateUpdate" || patchMethod.Name == "FixedUpdate"))
+                            if (patchMethod.GetParameters().Length == 0)
                             {
-                                if (TryRegisterDynamicLifecycleHook(originalType, patchMethod))
+                                if (patchMethod.Name == "Update" || patchMethod.Name == "LateUpdate" || patchMethod.Name == "FixedUpdate")
                                 {
-                                    patchedCount++;
-                                    patchedMethodNamesOut.Add($"{originalType.Name}.{patchMethod.Name} (Dynamic Bridge)");
+                                    if (TryRegisterDynamicLifecycleHook(originalType, patchMethod, isOneShot: false))
+                                    {
+                                        patchedCount++;
+                                        patchedMethodNamesOut.Add($"{originalType.Name}.{patchMethod.Name} (Dynamic Bridge)");
+                                    }
+                                    continue;
                                 }
-                                continue;
+
+                                if (patchMethod.Name == "Awake" || patchMethod.Name == "OnEnable" || patchMethod.Name == "Start")
+                                {
+                                    if (TryRegisterDynamicLifecycleHook(originalType, patchMethod, isOneShot: true))
+                                    {
+                                        patchedCount++;
+                                        patchedMethodNamesOut.Add($"{originalType.Name}.{patchMethod.Name} (Dynamic Lifecycle)");
+                                    }
+                                    continue;
+                                }
                             }
 
                             if (_unityNativeMessagesRequiringReload.Contains(patchMethod.Name))
@@ -1106,9 +1854,10 @@ namespace Nyks.HotReload.Editor.Core
                             }
                         }
 
-                        // Any newly added private method (with or without parameters, void or non-void, static or instance)
-                        // is called directly by other patched methods/delegates within the same class and NEVER requires a Domain Reload!
-                        if (patchMethod.IsPrivate)
+                        // Any newly added non-virtual method (private, internal, protected, or public helper method)
+                        // that does not require a new vtable/interface slot is called directly by patched methods in the batch
+                        // and NEVER requires a Domain Reload!
+                        if (!patchMethod.IsVirtual && !patchMethod.IsAbstract)
                         {
                             if (isMonoBehaviour && !patchMethod.IsStatic &&
                                 patchMethod.GetParameters().Length == 0 && patchMethod.ReturnType == typeof(void))
@@ -1117,12 +1866,12 @@ namespace Nyks.HotReload.Editor.Core
                             }
 
                             patchedCount++;
-                            patchedMethodNamesOut.Add($"{originalType.Name}.{patchMethod.Name} (New Private Method)");
+                            patchedMethodNamesOut.Add($"{originalType.Name}.{patchMethod.Name} (New Method)");
                             continue;
                         }
 
-                        // Any new non-private method (e.g. interface implementation `public void Collect()`)
-                        // requires a Domain Reload in Edit Mode (or advisory in Play Mode) to exist in external metadata
+                        // Any new virtual/interface method requires a Domain Reload in Edit Mode (or advisory in Play Mode)
+                        // so the runtime vtable/interface dispatch map is updated.
                         requiresDomainReload = true;
                         if (string.IsNullOrEmpty(reloadReason))
                         {
@@ -1396,6 +2145,31 @@ namespace Nyks.HotReload.Editor.Core
             return count;
         }
 
+        private static bool IsPureConstOrStaticContainer(Type patchType)
+        {
+            if (patchType == null || patchType.IsEnum || patchType.IsInterface || typeof(UnityEngine.Object).IsAssignableFrom(patchType))
+            {
+                return false;
+            }
+
+            const BindingFlags instFlags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
+            if (patchType.GetFields(instFlags).Length > 0)
+            {
+                return false;
+            }
+
+            MethodInfo[] instMethods = patchType.GetMethods(instFlags);
+            for (int i = 0; i < instMethods.Length; i++)
+            {
+                if (!instMethods[i].IsSpecialName)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
         private static bool AreInstanceFieldLayoutsCompatible(Type typeA, Type typeB)
         {
             const BindingFlags instFlags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
@@ -1525,7 +2299,7 @@ namespace Nyks.HotReload.Editor.Core
             return null;
         }
 
-        private static unsafe bool TryRegisterDynamicLifecycleHook(Type originalType, MethodInfo patchMethod)
+        private static unsafe bool TryRegisterDynamicLifecycleHook(Type originalType, MethodInfo patchMethod, bool isOneShot = false)
         {
             try
             {
@@ -1537,19 +2311,95 @@ namespace Nyks.HotReload.Editor.Core
                 }
 
                 string key = $"{originalType.FullName}.{patchMethod.Name}";
-                _dynamicLifecycleHooks[key] = new DynamicLifecycleHook
+                var hook = new DynamicLifecycleHook
                 {
                     OriginalComponentType = originalType,
                     MethodName = patchMethod.Name,
-                    FunctionPointer = fnPtr
+                    FunctionPointer = fnPtr,
+                    IsOneShot = isOneShot,
+                    ExecutedInstanceIds = isOneShot ? new HashSet<int>() : null
                 };
+                _dynamicLifecycleHooks[key] = hook;
+
                 Application.onBeforeRender -= OnBeforeRenderDynamicUpdates;
                 Application.onBeforeRender += OnBeforeRenderDynamicUpdates;
+
+                // If we are already actively in Play Mode when this one-shot lifecycle method (Awake / OnEnable / Start)
+                // is added or edited, execute it immediately on all active scene instances!
+                if (isOneShot && EditorApplication.isPlaying)
+                {
+                    ExecuteOneShotHookOnActiveInstances(hook);
+                }
+
                 return true;
             }
             catch
             {
                 return false;
+            }
+        }
+
+        private static unsafe void ExecuteOneShotHookOnActiveInstances(DynamicLifecycleHook hook)
+        {
+            if (hook == null || !hook.IsOneShot || hook.OriginalComponentType == null || hook.FunctionPointer == IntPtr.Zero)
+            {
+                return;
+            }
+
+            if (hook.ExecutedInstanceIds == null)
+            {
+                hook.ExecutedInstanceIds = new HashSet<int>();
+            }
+
+#pragma warning disable CS0618
+            UnityEngine.Object[] instances = UnityEngine.Object.FindObjectsOfType(hook.OriginalComponentType);
+#pragma warning restore CS0618
+            if (instances == null || instances.Length == 0)
+            {
+                return;
+            }
+
+            var fn = (delegate*<object, void>)hook.FunctionPointer;
+            for (int i = 0; i < instances.Length; i++)
+            {
+                if (instances[i] is MonoBehaviour mb && mb != null && mb.isActiveAndEnabled)
+                {
+                    int instKey = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(mb);
+                    if (hook.ExecutedInstanceIds.Add(instKey))
+                    {
+                        try
+                        {
+                            fn(mb);
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.LogException(ex, mb);
+                        }
+                    }
+                }
+            }
+        }
+
+        private static void ExecutePendingOneShotLifecycleHooks()
+        {
+            if (!EditorApplication.isPlaying || _dynamicLifecycleHooks.Count == 0)
+            {
+                return;
+            }
+
+            // Execute in Unity's deterministic initialization order: Awake -> OnEnable -> Start
+            string[] order = { "Awake", "OnEnable", "Start" };
+            for (int o = 0; o < order.Length; o++)
+            {
+                string targetName = order[o];
+                foreach (var kvp in _dynamicLifecycleHooks)
+                {
+                    DynamicLifecycleHook hook = kvp.Value;
+                    if (hook != null && hook.IsOneShot && string.Equals(hook.MethodName, targetName, StringComparison.Ordinal))
+                    {
+                        ExecuteOneShotHookOnActiveInstances(hook);
+                    }
+                }
             }
         }
 
@@ -1793,10 +2643,13 @@ namespace Nyks.HotReload.Editor.Core
                 return;
             }
 
+            // Ensure any newly instantiated objects run dynamic Awake / OnEnable / Start once before Update!
+            ExecutePendingOneShotLifecycleHooks();
+
             foreach (var kvp in _dynamicLifecycleHooks)
             {
                 DynamicLifecycleHook hook = kvp.Value;
-                if (hook == null || hook.OriginalComponentType == null || hook.FunctionPointer == IntPtr.Zero)
+                if (hook == null || hook.IsOneShot || hook.OriginalComponentType == null || hook.FunctionPointer == IntPtr.Zero)
                 {
                     continue;
                 }
@@ -2089,6 +2942,13 @@ namespace Nyks.HotReload.Editor.Core
                 }
                 case "CS1002":
                     return "Satır sonunda noktalı virgül (;) eksik.";
+                case "CS1003":
+                {
+                    string sym = ExtractFirstSingleQuoted(msg);
+                    return sym == ":"
+                        ? "Sözdizimi hatası: ':' (iki nokta üst üste) bekleniyor (örneğin 'switch/case' satırında ';' yerine ':' olmalı)."
+                        : $"Sözdizimi hatası: '{sym ?? msg}' karakteri bekleniyor ({msg})";
+                }
                 case "CS1513":
                     return "Süslü parantez kapatma (}) eksik.";
                 case "CS1026":
